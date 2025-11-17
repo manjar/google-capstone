@@ -6,25 +6,58 @@ This document tracks the development process for the competition writeup and per
 
 ## Project Timeline
 
-**Start Date:** ___________
+**Start Date:** November 17, 2025
 **Target Completion:** December 1, 2025
 **Submission Deadline:** December 1, 2025, 11:59 AM PT
+**Days Remaining:** 14 days
+
+---
+
+## Milestones
+
+| Phase | Description | Status | Commit | Date |
+|-------|-------------|--------|--------|------|
+| 1 | Minimal E2E Prototype | ✅ Complete | `28ee7a6` | Nov 17, 2025 |
+| 2 | Multi-Agent & Preferences | 🔄 Next | - | - |
+| 3 | Scoring & Dashboard | ⏳ Pending | - | - |
+| 4 | Break Mode & Polish | ⏳ Pending | - | - |
+| 5 | Submission Prep | ⏳ Pending | - | - |
 
 ---
 
 ## Daily Log
 
-### Day 1 - [Date]
-**Focus:**
-**Hours Spent:**
+### Day 1 - November 17, 2025
+**Focus:** Phase 1 - Minimal E2E Prototype
+**Hours Spent:** ~3 hours
 **Completed:**
--
+- Project structure and setup
+- FastAPI skeleton with endpoints (`/api/chat`, `/api/timers`)
+- SQLite database for timer storage
+- Structured JSON logging for observability
+- **ADK Integration**:
+  - Installed from GitHub: `pip install git+https://github.com/google/adk-python.git@main`
+  - Real `Agent` class with custom tools
+  - Real `Runner` with async execution
+  - `InMemorySessionService` for session management
+- Custom tool: `create_timer_tool` with urgency scoring
+- End-to-end test successful: "I need to submit my report by Friday" → Timer created with deadline 2025-11-21T17:00:00
 
 **Blocked By:**
--
+- Initially tried PyPI `google-adk` (v0.0.1 placeholder) - had to install from GitHub
+- Session service methods are async - needed to add `await`
+
+**Key Learnings:**
+- ADK not yet on PyPI as stable release - use GitHub main branch
+- ADK Runner handles tool execution automatically
+- Session IDs enable conversation continuity
+
+**Commit:** `28ee7a6` - "Phase 1 complete"
 
 **Next Steps:**
--
+- Phase 2: Add sub-agents (Extraction, Preference)
+- Implement preference learning
+- Upgrade to VertexAI services
 
 ---
 

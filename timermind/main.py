@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from jinja2 import Environment, FileSystemLoader
 
 # Load environment variables
 load_dotenv()
@@ -33,11 +35,16 @@ if not GEMINI_API_KEY:
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
+TEMPLATES_DIR = BASE_DIR / "templates"
 DB_PATH = DATA_DIR / "timermind.db"
 
 # Ensure directories exist
 DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
+TEMPLATES_DIR.mkdir(exist_ok=True)
+
+# Jinja2 template environment
+jinja_env = Environment(loader=FileSystemLoader(TEMPLATES_DIR))
 
 # =============================================================================
 # Structured Logging Setup (Observability)
@@ -280,7 +287,11 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 log_event("gemini_configured", {"status": "success"})
 
-# Define tools as Python functions with proper signatures for ADK
+# =============================================================================
+# Tool Definitions for Agents
+# =============================================================================
+
+# Timer Management Tools (for Extraction Agent)
 def create_timer_tool(
     label: str,
     description: str = "",
@@ -290,9 +301,6 @@ def create_timer_tool(
 ) -> dict:
     """
     Create a new timer/task in the system.
-
-    Use this tool when the user describes something they need to do,
-    a deadline they need to meet, or a task they want to track.
 
     Args:
         label: Short, clear name for the task (e.g., "Submit report")
@@ -306,12 +314,7 @@ def create_timer_tool(
     """
     log_event("tool_called", {
         "tool": "create_timer",
-        "args": {
-            "label": label,
-            "description": description,
-            "deadline_iso": deadline_iso,
-            "category": category
-        }
+        "args": {"label": label, "deadline_iso": deadline_iso, "category": category}
     })
 
     result = create_timer_in_db(
@@ -322,54 +325,401 @@ def create_timer_tool(
         category=category,
         tags=[]
     )
-
     return result
 
 def get_current_timers_tool() -> dict:
     """
-    Retrieve all current active timers.
-
-    Use this tool to see what tasks the user is currently tracking.
+    Retrieve all current active timers sorted by priority.
+    Also includes recently completed/deleted tasks for context.
 
     Returns:
-        dict containing list of timer objects with their details and scores
+        dict containing list of active timer objects and recently completed ones
     """
     log_event("tool_called", {"tool": "get_current_timers"})
     timers = list_timers_from_db()
-    log_event("tool_result", {"tool": "get_current_timers", "count": len(timers)})
-    return {"timers": timers, "count": len(timers)}
 
-# Create the root agent using ADK
-root_agent = Agent(
-    name="timermind",
+    # Also get recently completed/deleted tasks (last 24 hours) for context
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        recent = conn.execute("""
+            SELECT * FROM timers
+            WHERE status IN ('completed', 'deleted')
+            AND datetime(updated_at) > datetime('now', '-24 hours')
+            ORDER BY updated_at DESC
+            LIMIT 10
+        """).fetchall()
+
+    recent_tasks = [dict(row) for row in recent]
+
+    return {
+        "active_timers": timers,
+        "count": len(timers),
+        "recently_completed": recent_tasks
+    }
+
+def update_timer_tool(timer_id: int, status: str = "", category: str = "", deadline_iso: str = "") -> dict:
+    """
+    Update an existing timer's properties.
+
+    Args:
+        timer_id: ID of the timer to update
+        status: New status (active, completed, snoozed, deleted)
+        category: New category
+        deadline_iso: New deadline in ISO 8601 format
+
+    Returns:
+        dict with update status and new scores if deadline changed
+    """
+    log_event("tool_called", {"tool": "update_timer", "timer_id": timer_id, "deadline_iso": deadline_iso})
+
+    with sqlite3.connect(DB_PATH) as conn:
+        updates = []
+        params = []
+        new_urgency = None
+
+        if status:
+            updates.append("status = ?")
+            params.append(status)
+        if category:
+            updates.append("category = ?")
+            params.append(category)
+        if deadline_iso:
+            updates.append("deadline = ?")
+            params.append(deadline_iso)
+            # Recompute urgency score
+            new_urgency = compute_urgency_score(deadline_iso)
+            updates.append("urgency_score = ?")
+            params.append(new_urgency)
+            # Update priority score (simple average for now)
+            updates.append("priority_score = (? + importance_score) / 2")
+            params.append(new_urgency)
+
+        if updates:
+            updates.append("updated_at = ?")
+            params.append(datetime.now(timezone.utc).isoformat())
+            params.append(timer_id)
+            conn.execute(f"UPDATE timers SET {', '.join(updates)} WHERE id = ?", params)
+
+    result = {"timer_id": timer_id, "updated": True}
+    if new_urgency is not None:
+        result["new_urgency_score"] = new_urgency
+        result["deadline"] = deadline_iso
+
+    return result
+
+# Preference Management Tools (for Preference Agent)
+def get_user_preferences_tool() -> dict:
+    """
+    Retrieve current user preferences for task prioritization.
+
+    Returns:
+        dict containing preference weights and rules
+    """
+    log_event("tool_called", {"tool": "get_user_preferences"})
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT key, value FROM preferences").fetchall()
+
+    prefs = {row["key"]: json.loads(row["value"]) for row in rows}
+
+    # Return defaults if no preferences set
+    if not prefs:
+        prefs = {
+            "category_weights": {
+                "work": 1.0,
+                "personal": 0.8,
+                "health": 1.2,
+                "finance": 1.1,
+                "maintenance": 0.7,
+                "other": 0.5
+            },
+            "rules": []
+        }
+
+    return {"preferences": prefs}
+
+def update_category_weight_tool(category: str, weight: float) -> dict:
+    """
+    Update the priority weight for a specific category.
+
+    Higher weights mean tasks in that category are considered more important.
+
+    Args:
+        category: Category name (work, personal, health, finance, maintenance, other)
+        weight: New weight value (0.1 to 2.0, where 1.0 is neutral)
+
+    Returns:
+        dict with update confirmation
+    """
+    log_event("tool_called", {"tool": "update_category_weight", "category": category, "weight": weight})
+
+    # Get current weights
+    prefs = get_user_preferences_tool()["preferences"]
+    weights = prefs.get("category_weights", {})
+    weights[category] = max(0.1, min(2.0, weight))  # Clamp to valid range
+
+    # Save to database
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO preferences (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+        """, ("category_weights", json.dumps(weights), now, json.dumps(weights), now))
+
+    return {"category": category, "new_weight": weights[category], "updated": True}
+
+def add_preference_rule_tool(rule_description: str, rule_type: str, condition: str, action: str) -> dict:
+    """
+    Add a new preference rule for task prioritization.
+
+    Args:
+        rule_description: Human-readable description of the rule
+        rule_type: Type of rule (boost, suppress, filter)
+        condition: When the rule applies (e.g., "category=work AND day=weekend")
+        action: What to do (e.g., "multiply_priority=0.5")
+
+    Returns:
+        dict with rule creation confirmation
+    """
+    log_event("tool_called", {"tool": "add_preference_rule", "rule_type": rule_type})
+
+    # Get current rules
+    prefs = get_user_preferences_tool()["preferences"]
+    rules = prefs.get("rules", [])
+
+    # Add new rule
+    new_rule = {
+        "id": len(rules) + 1,
+        "description": rule_description,
+        "type": rule_type,
+        "condition": condition,
+        "action": action,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    rules.append(new_rule)
+
+    # Save to database
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO preferences (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+        """, ("rules", json.dumps(rules), now, json.dumps(rules), now))
+
+    return {"rule_id": new_rule["id"], "description": rule_description, "created": True}
+
+# =============================================================================
+# Sub-Agent Definitions (Multi-Agent Architecture)
+# =============================================================================
+
+# Context Resolution Agent - Maps natural language to existing timer data
+context_agent = Agent(
+    name="context_agent",
     model="gemini-2.0-flash-exp",
-    description="Personal task prioritization assistant that extracts timers from natural language",
+    description="Resolves natural language references to existing timers and their data",
     instruction="""
-You are TimerMind, a personal task prioritization assistant.
+You are the Context Resolution Agent. Your ONLY job is to map natural language task references to existing timer data.
 
-Your primary job is to help users track deadlines and tasks by:
-1. Extracting task information from natural language descriptions
-2. Creating timers with appropriate deadlines and categories
-3. Explaining what you've created and why
+When given a query about existing tasks:
+1. ALWAYS call get_current_timers_tool first
+2. Find timers that match the natural language references
+3. Return the relevant timer details (especially deadlines)
 
-When a user describes something they need to do:
-- Extract the task label (clear, concise name)
-- Infer or extract the deadline if mentioned
-- Determine the category (work, personal, health, finance, maintenance, other)
-- Use the create_timer_tool to save it
+Examples:
+- "getting the mail" → Look for timer with "mail" in label, return its deadline
+- "picking up Willem" → Look for timer with "Willem" in label, return its deadline
+- "the report" → Look for timer with "report" in label, return its deadline
+- "between X and Y" → Find both timers, return both deadlines so caller can calculate middle time
 
-For deadlines (today is {today}):
-- "by Friday" = end of this Friday (17:00 local time), use ISO format like "2025-11-21T17:00:00"
+You must be fuzzy-matching friendly:
+- "getting the mail" matches "Get mail from mailbox"
+- "picking up willem" matches "Pick up Willem"
+- "my appointment" matches "Doctor appointment" or "Dentist appointment"
+
+Return structured data about the matched timers including their IDs, labels, and deadlines.
+If no match is found, clearly state that.
+""",
+    tools=[get_current_timers_tool]
+)
+
+# Planning Agent - Creates and tracks execution plans
+planning_agent = Agent(
+    name="planning_agent",
+    model="gemini-2.0-flash-exp",
+    description="Creates step-by-step execution plans and ensures all steps are completed",
+    instruction="""
+You are the Planning Agent. Your job is to EXECUTE multi-step tasks to completion.
+
+IMPORTANT: Do NOT output a plan first. Instead:
+1. Internally plan the steps needed
+2. IMMEDIATELY start executing by calling tools
+3. Only report results AFTER all steps are done
+
+For "between getting the mail and picking up willem, I need lunch":
+1. Call get_current_timers_tool to find the mail and willem timers
+2. Extract their deadlines from the results
+3. Calculate midpoint: if mail=13:39 and willem=14:44, midpoint is ~14:11
+4. Call create_timer_tool with label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal"
+5. Report: "Created Lunch timer at 14:11 (between mail at 13:39 and Willem at 14:44)"
+
+YOU MUST:
+- Call tools immediately, don't just describe what you would do
+- Use the ACTUAL data from tool results
+- Complete ALL steps before responding
+- End with the final action (create/update/delete) being executed
+- Report what you accomplished, not what you plan to do
+
+If you need to resolve task references, delegate to context_agent first, then use those results.
+""",
+    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool],
+    sub_agents=[context_agent]
+)
+
+# Extraction Agent - Specializes in parsing tasks from natural language
+extraction_agent = Agent(
+    name="extraction_agent",
+    model="gemini-2.0-flash-exp",
+    description="Extracts structured timer/task information from natural language input",
+    instruction="""
+You are the Extraction Agent, specialized in parsing task information from natural language.
+
+Your job is to:
+1. Identify tasks, deadlines, and time-sensitive items in user messages
+2. Extract structured information (label, deadline, category, duration)
+3. ALWAYS check existing timers first using get_current_timers_tool
+4. Update existing timers if they match, or create new ones
+
+IMPORTANT WORKFLOW:
+1. If user references existing tasks by name (e.g., "between getting the mail and picking up willem"), DELEGATE to context_agent first to resolve those references to actual timer data
+2. Once you have the timer data (deadlines, IDs), YOU MUST USE THAT DATA to complete the task - DO NOT just report what you found
+3. ALWAYS finish by creating/updating/deleting the timer as requested
+4. Call get_current_timers_tool to see what tasks exist if needed
+5. If user mentions a task that matches an existing active timer, UPDATE it
+6. If user references a recently completed task, use that info to CREATE a new one
+
+CRITICAL: After getting context data, you MUST take action. Example:
+- User says: "between getting the mail and picking up willem, I need lunch"
+- Step 1: DELEGATE to context_agent → returns mail deadline (13:39) and willem deadline (14:44)
+- Step 2: Calculate midpoint: (13:39 + 14:44) / 2 ≈ 14:11
+- Step 3: CALL create_timer_tool with label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal"
+- Step 4: Report success to user
+
+You MUST call create_timer_tool or update_timer_tool to complete the task. Never just report data without acting on it.
+
+For deadlines (today is {today}, current time is {current_time}):
+- "by Friday" = this Friday at 17:00
 - "next week" = following Monday at 17:00
 - "in 3 days" = 3 days from now at 17:00
-- If no time specified, default to end of day (17:00)
+- "tomorrow morning" = next day at 09:00
+- "in 2 hours" = current time + 2 hours
+- "in 30 minutes" = current time + 30 minutes
+- "in about 2 and a half hours" = current time + 2.5 hours
+- "at 3pm" or "at 15:00" = today at that time (or tomorrow if already past)
+- If no time specified for day-based deadlines, default to 17:00
+- ALWAYS extract a deadline if ANY time reference is given, even approximate ones like "about", "around", "roughly"
 
-Always confirm what you've created and show the urgency score.
-If the user mentions multiple tasks, create multiple timers.
+Categories:
+- work: job-related tasks, meetings, reports
+- personal: errands, social, hobbies
+- health: medical, exercise, wellness
+- finance: bills, taxes, budgeting
+- maintenance: home repairs, car service, cleaning
+- other: anything that doesn't fit above
 
-Be conversational but efficient. Focus on accurately capturing their tasks.
+Status values:
+- active: task is pending/in progress
+- completed: task is done
+- deleted: task should be removed from view
+
+Always use ISO 8601 format for deadlines.
+Return a clear summary of what you did (created, updated, or deleted).
+""".format(
+        today=datetime.now().strftime("%A, %B %d, %Y"),
+        current_time=datetime.now().strftime("%H:%M")
+    ),
+    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool]
+)
+
+# Preference Agent - Specializes in learning user preferences
+preference_agent = Agent(
+    name="preference_agent",
+    model="gemini-2.0-flash-exp",
+    description="Learns and manages user preferences for task prioritization",
+    instruction="""
+You are the Preference Agent, specialized in learning user preferences.
+
+Your job is to:
+1. Identify preference signals in user messages
+2. Update category weights based on user statements
+3. Create rules for special prioritization logic
+
+Listen for statements like:
+- "Work is more important than personal stuff" → increase work weight
+- "Health should always come first" → set health weight to highest
+- "Don't bother me with work on weekends" → add suppression rule
+- "Bills are high priority" → increase finance weight
+
+Weight scale (0.1 to 2.0):
+- 0.1-0.5: Low priority
+- 0.6-0.9: Below average
+- 1.0: Neutral/average
+- 1.1-1.5: Above average
+- 1.6-2.0: High priority
+
+When updating preferences:
+1. Get current preferences first
+2. Make incremental adjustments (don't overhaul everything)
+3. Confirm changes with the user
+
+Be conversational and confirm what you've learned.
+""",
+    tools=[get_user_preferences_tool, update_category_weight_tool, add_preference_rule_tool]
+)
+
+# =============================================================================
+# Root Agent (Orchestrator)
+# =============================================================================
+
+root_agent = Agent(
+    name="timermind_orchestrator",
+    model="gemini-2.0-flash-exp",
+    description="Orchestrates task extraction and preference learning for TimerMind",
+    instruction="""
+You are TimerMind, the main orchestrator agent for personal task prioritization.
+
+You have three specialized sub-agents:
+1. **planning_agent**: For complex, multi-step requests that need planning and execution tracking
+2. **extraction_agent**: For simple, direct task operations (create, update, delete)
+3. **preference_agent**: Learns user preferences for prioritization
+
+Your job is to:
+1. Understand what the user wants
+2. Delegate to the appropriate sub-agent
+3. Synthesize responses and provide a unified experience
+
+Delegation guidelines:
+- If request involves references to OTHER tasks (e.g., "between X and Y", "after the meeting") → delegate to planning_agent
+- If request needs multiple steps or calculations → delegate to planning_agent
+- If user describes a simple new task with explicit deadline → delegate to extraction_agent
+- If user wants to UPDATE/COMPLETE/DELETE a task by name → delegate to extraction_agent
+- If user expresses preferences/priorities/importance → delegate to preference_agent
+- If user asks about current timers → use get_current_timers_tool directly
+
+Examples:
+- "I need to pick up Willem at 3pm" → extraction_agent (simple, explicit)
+- "Between getting the mail and picking up Willem, I need lunch" → planning_agent (references other tasks, needs calculation)
+- "Health is my top priority" → preference_agent
+- "Mark the report as done" → extraction_agent (simple update)
+
+IMPORTANT: Use planning_agent for anything that requires looking up existing timer data and then acting on it.
+
+Today is {today}.
 """.format(today=datetime.now().strftime("%A, %B %d, %Y")),
-    tools=[create_timer_tool, get_current_timers_tool]
+    tools=[get_current_timers_tool],
+    sub_agents=[planning_agent, extraction_agent, preference_agent]
 )
 
 # Create session service (using InMemory for now, will upgrade to VertexAI later)
@@ -382,11 +732,16 @@ runner = Runner(
     session_service=session_service
 )
 
-log_event("adk_agent_initialized", {
-    "name": "timermind",
-    "model": "gemini-2.0-flash-exp",
-    "tools": ["create_timer_tool", "get_current_timers_tool"],
-    "session_service": "InMemorySessionService"
+log_event("adk_multi_agent_initialized", {
+    "root_agent": "timermind_orchestrator",
+    "sub_agents": ["planning_agent", "extraction_agent", "preference_agent"],
+    "planning_sub_agents": ["context_agent"],
+    "planning_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool"],
+    "extraction_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool"],
+    "context_tools": ["get_current_timers_tool"],
+    "preference_tools": ["get_user_preferences_tool", "update_category_weight_tool", "add_preference_rule_tool"],
+    "session_service": "InMemorySessionService",
+    "model": "gemini-2.0-flash-exp"
 })
 
 # =============================================================================
@@ -407,9 +762,16 @@ class ChatResponse(BaseModel):
     response: str
     timers: list
     session_id: Optional[str] = None
+    execution_trace: list = []  # List of execution events for thought process visibility
 
-@app.get("/")
-async def root():
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the TimerMind dashboard UI."""
+    template = jinja_env.get_template("dashboard.html")
+    return template.render()
+
+@app.get("/api/health")
+async def health():
     """Health check and API info."""
     return {
         "service": "TimerMind",
@@ -465,26 +827,70 @@ async def chat(request: ChatRequest):
         # - Processing tool calls
         # - Managing conversation history in session
         response_text = ""
+        execution_trace = []
+
+        # Inject current time context into the message
+        current_datetime = datetime.now()
+        time_context = f"[Current time: {current_datetime.strftime('%A, %B %d, %Y at %H:%M')}]\n\n"
+        message_with_context = time_context + request.message
 
         async for event in runner.run_async(
             user_id=user_id,
             session_id=session_id,
             new_message=types.Content(
                 role="user",
-                parts=[types.Part(text=request.message)]
+                parts=[types.Part(text=message_with_context)]
             )
         ):
+            event_type = type(event).__name__
+
             # Log each event for observability
             log_event("runner_event", {
-                "event_type": type(event).__name__,
+                "event_type": event_type,
                 "session_id": session_id
             })
 
-            # Extract text from response events
+            # Build execution trace for frontend
+            trace_event = {
+                "type": event_type,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Capture relevant details based on event type
+            if hasattr(event, "agent") and event.agent:
+                trace_event["agent"] = event.agent.name
+                trace_event["event_category"] = "delegation"
+
+            if hasattr(event, "tool_call") and event.tool_call:
+                trace_event["event_category"] = "tool-call"
+                trace_event["tool_name"] = getattr(event.tool_call, "name", "unknown")
+
             if hasattr(event, "content") and event.content:
+                # Check for function calls in parts
+                has_function_call = False
                 for part in event.content.parts:
+                    # Extract function call information
+                    if hasattr(part, "function_call") and part.function_call:
+                        has_function_call = True
+                        trace_event["event_category"] = "tool-call"
+                        trace_event["tool_name"] = part.function_call.name
+                        if hasattr(part.function_call, "args") and part.function_call.args:
+                            trace_event["tool_args"] = str(part.function_call.args)[:200]
+
+                    # Extract text from response
                     if hasattr(part, "text") and part.text:
                         response_text += part.text
+                        if not has_function_call:  # Only show text preview if not a function call
+                            if len(part.text) > 100:
+                                trace_event["content_preview"] = part.text[:100] + "..."
+                            else:
+                                trace_event["content_preview"] = part.text
+
+            # Only add events that have meaningful information
+            if ("event_category" in trace_event or
+                "content_preview" in trace_event or
+                "agent" in trace_event):
+                execution_trace.append(trace_event)
 
         if not response_text:
             response_text = "I processed your request."
@@ -495,13 +901,15 @@ async def chat(request: ChatRequest):
         log_event("chat_response", {
             "response_length": len(response_text),
             "timers_count": len(updated_timers),
-            "session_id": session_id
+            "session_id": session_id,
+            "trace_events": len(execution_trace)
         })
 
         return ChatResponse(
             response=response_text,
             timers=updated_timers,
-            session_id=session_id
+            session_id=session_id,
+            execution_trace=execution_trace
         )
 
     except Exception as e:
@@ -513,6 +921,22 @@ async def chat(request: ChatRequest):
         })
         raise HTTPException(status_code=500, detail=str(e))
 
+class TimerUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    category: Optional[str] = None
+    deadline: Optional[str] = None
+
+@app.patch("/api/timers/{timer_id}")
+async def update_timer(timer_id: int, request: TimerUpdateRequest):
+    """Update a timer's properties."""
+    result = update_timer_tool(
+        timer_id=timer_id,
+        status=request.status or "",
+        category=request.category or "",
+        deadline_iso=request.deadline or ""
+    )
+    return result
+
 @app.delete("/api/timers/{timer_id}")
 async def delete_timer(timer_id: int):
     """Delete a timer by ID."""
@@ -520,6 +944,27 @@ async def delete_timer(timer_id: int):
         conn.execute("UPDATE timers SET status = 'deleted' WHERE id = ?", (timer_id,))
     log_event("timer_deleted", {"timer_id": timer_id})
     return {"status": "deleted", "timer_id": timer_id}
+
+@app.get("/api/preferences")
+async def get_preferences():
+    """Get current user preferences."""
+    prefs = get_user_preferences_tool()
+    return prefs
+
+@app.post("/api/reset")
+async def reset_data():
+    """
+    Reset all data - clear timers and preferences.
+    Useful for testing and starting fresh.
+    """
+    log_event("data_reset_requested", {})
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM timers")
+        conn.execute("DELETE FROM preferences")
+
+    log_event("data_reset_completed", {"timers_cleared": True, "preferences_cleared": True})
+    return {"status": "reset", "message": "All timers and preferences cleared"}
 
 # =============================================================================
 # Main Entry Point
@@ -532,8 +977,8 @@ if __name__ == "__main__":
     print("\n" + "="*50)
     print("TimerMind Server Starting")
     print("="*50)
-    print(f"API: http://127.0.0.1:8000")
-    print(f"Docs: http://127.0.0.1:8000/docs")
+    print(f"Dashboard: http://127.0.0.1:8000")
+    print(f"API Docs: http://127.0.0.1:8000/docs")
     print(f"Database: {DB_PATH}")
     print(f"Logs: {LOGS_DIR}")
     print("="*50 + "\n")

@@ -28,34 +28,53 @@
 
 ---
 
-## Phase 2: Multi-Agent & Preferences
+## Phase 2: Multi-Agent & Preferences ✅ COMPLETE
 **Goal:** Sub-agents with preference learning
+**Status:** Done (Nov 17, 2025)
+**Commit:** `5883409` - "Phase 2 complete"
 **Estimated:** 3-4 days
 
-### Tasks
-- [ ] **Extraction Agent** (sub-agent)
+### Completed
+- [x] **Extraction Agent** (sub-agent)
   - Dedicated agent for parsing tasks
-  - Tools: `create_timer`, `update_timer`, `list_timers`
-  - Test with various input formats
+  - Tools: `create_timer_tool`, `update_timer_tool`, `get_current_timers_tool`
+  - Tested with various input formats
 
-- [ ] **Preference Agent** (sub-agent)
+- [x] **Preference Agent** (sub-agent)
   - Learns user preferences from conversation
-  - Tools: `update_weight`, `add_rule`, `get_preferences`
-  - Store preferences in SQLite
+  - Tools: `update_category_weight_tool`, `add_preference_rule_tool`, `get_user_preferences_tool`
+  - Stores preferences in SQLite
 
-- [ ] **Root Agent Orchestration**
-  - Delegates to appropriate sub-agent
-  - Uses session context for continuity
+- [x] **Root Agent Orchestration**
+  - Delegates to extraction_agent, preference_agent, planning_agent
+  - Uses InMemorySessionService for session continuity
+  - Context-aware delegation logic
 
-- [ ] **Upgrade to VertexAI Services**
-  - Replace `InMemorySessionService` → `VertexAiSessionService`
-  - Add `VertexAiMemoryBankService` for long-term memory
-  - Test: preferences persist across restarts
+- [x] **Context Resolution Agent** (bonus)
+  - Fuzzy-matches natural language references to existing timers
+  - Sub-agent of planning_agent
+
+- [x] **Planning Agent** (bonus)
+  - Handles multi-step execution for complex requests
+  - Executes plans to completion (not just describes)
+  - Sub-agent: context_agent
+
+- [x] **Interactive Dashboard** (bonus)
+  - Chat interface with tabbed view (Chat / Thought Process)
+  - Execution trace visibility (tool calls, delegations)
+  - Logarithmic countdown timers with non-linear scale
+  - Real-time timer management (complete/delete)
+
+### Deferred
+- [ ] **Upgrade to VertexAI Services** (deferred to post-MVP)
+  - InMemorySessionService works fine for demo
+  - Sessions persist during runtime
+  - VertexAI services can be added later for production
 
 ### Success Criteria
-- Multi-agent delegation working
-- Preferences learned and stored
-- Memory persists across sessions
+- ✅ Multi-agent delegation working
+- ✅ Preferences learned and stored
+- ⚠️  Memory persists across sessions (runtime only, not restarts)
 
 ---
 

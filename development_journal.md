@@ -18,8 +18,8 @@ This document tracks the development process for the competition writeup and per
 | Phase | Description | Status | Commit | Date |
 |-------|-------------|--------|--------|------|
 | 1 | Minimal E2E Prototype | ✅ Complete | `28ee7a6` | Nov 17, 2025 |
-| 2 | Multi-Agent & Preferences | 🔄 Next | - | - |
-| 3 | Scoring & Dashboard | ⏳ Pending | - | - |
+| 2 | Multi-Agent & Preferences | ✅ Complete | `5883409` | Nov 17, 2025 |
+| 3 | Scoring & Dashboard | 🔄 Next | - | - |
 | 4 | Break Mode & Polish | ⏳ Pending | - | - |
 | 5 | Submission Prep | ⏳ Pending | - | - |
 
@@ -61,17 +61,47 @@ This document tracks the development process for the competition writeup and per
 
 ---
 
-### Day 2 - [Date]
-**Focus:**
-**Hours Spent:**
+### Day 2 - November 17, 2025
+**Focus:** Phase 2 - Multi-Agent System & Interactive Dashboard
+**Hours Spent:** ~6 hours
+**Commit:** `5883409` - "Phase 2 complete"
 **Completed:**
--
+- **Multi-Agent Architecture**:
+  - Created `extraction_agent` with timer CRUD tools
+  - Created `preference_agent` with preference learning tools
+  - Created `context_agent` for fuzzy-matching task references
+  - Created `planning_agent` for multi-step execution
+  - Root agent orchestrates delegation with context-aware logic
+- **Interactive Dashboard UI**:
+  - Chat interface with tabbed view (Chat / Thought Process)
+  - Execution trace visibility showing tool calls and agent delegations
+  - Logarithmic countdown timers with non-linear time scale
+  - Real-time timer management (complete/delete buttons)
+  - Fixed-height scrollable content areas
+- **Agent Improvements**:
+  - Planning agent executes plans to completion (not just describes)
+  - Context agent resolves references like "between X and Y"
+  - Time context injection in each message
+  - Tool extraction from ADK Runner events
+  - Filtered execution trace (only meaningful events)
 
 **Blocked By:**
--
+- ADK constraint: agents can only have ONE parent (resolved by restructuring)
+- Agent outputting plans but not executing (resolved with instruction changes)
+
+**Key Learnings:**
+- ADK Runner events contain `function_call` parts that need explicit extraction
+- Planning agents need explicit instructions to EXECUTE not just DESCRIBE
+- Filtering empty events makes thought process much cleaner
+- Dashboard provides essential visibility into multi-agent execution
+
+**Deferred:**
+- VertexAI services upgrade (InMemorySessionService sufficient for MVP)
 
 **Next Steps:**
--
+- Phase 3: Importance scoring algorithm
+- Dashboard enhancements (if needed)
+- Testing multi-step scenarios
 
 ---
 
@@ -175,13 +205,20 @@ This document tracks the development process for the competition writeup and per
 
 ### Agent Definition Patterns
 **What Worked:**
--
+- Clear, specific delegation logic in root agent instructions
+- Giving agents EXECUTE vs DESCRIBE instructions (not just planning)
+- Sub-agent architecture: planning_agent → context_agent
+- Specialized agents for specific tasks (extraction, preference, context, planning)
 
 **What Didn't Work:**
--
+- Initially tried to make context_agent sub-agent of BOTH planning_agent and extraction_agent
+- Vague instructions led to agents describing plans instead of executing them
 
 **ADK Quirks/Gotchas:**
--
+- **CRITICAL**: Each agent can only have ONE parent agent
+- Agent instructions need to be VERY explicit about execution vs planning
+- Runner events are generic "Event" type, need to inspect content.parts for details
+- Function calls are in `part.function_call`, not top-level attributes
 
 ---
 

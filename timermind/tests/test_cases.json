@@ -201,5 +201,106 @@
     },
     "regression_for": "Recurring tasks only create one timer instead of multiple instances",
     "fixed_in_commit": "TBD"
+  },
+  {
+    "id": "test_009_fuzzy_reference_update",
+    "name": "Fuzzy reference update scenario",
+    "description": "Tests that extraction_agent can resolve fuzzy references when updating existing timers",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "I need to finish the project report by Friday at 5 PM",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_label_contains": "report"
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Actually, change that report deadline to Thursday at 3 PM instead",
+        "expected_behavior": {
+          "updates_timer": true,
+          "timer_count": 1
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    },
+    "purpose": "Verify that extraction_agent can handle fuzzy references like 'that report' when updating timers"
+  },
+  {
+    "id": "test_010_between_two_tasks",
+    "name": "Between two tasks - context resolution scenario",
+    "description": "Tests the 'between X and Y' scenario where extraction_agent resolves references to existing timers",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "I need to get the mail by 1:30 PM",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_label_contains": "mail"
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "I need to pick up Willem at 3:00 PM",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_count": 2
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Between getting the mail and picking up Willem, I need to have lunch",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_count": 3
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    },
+    "purpose": "Tests extraction_agent's ability to resolve fuzzy references to existing timers and calculate appropriate deadlines"
+  },
+  {
+    "id": "test_011_preference_importance_recalc",
+    "name": "Preference-based importance recalculation",
+    "description": "Tests that preference_agent recalculates importance of existing timers when user states a category-based preference",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "I need to see a movie with my friend tomorrow at 5 PM",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_label_contains": "movie",
+          "category": "personal",
+          "importance_score_range": [0.2, 0.4]
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Doing stuff with my friends is very important to me",
+        "expected_behavior": {
+          "updates_preferences": true,
+          "recalculates_existing_timers": true,
+          "response_mentions": ["friend", "important", "updated"]
+        }
+      },
+      {
+        "action": "verify_timer_update",
+        "timer_label_contains": "movie",
+        "expected_behavior": {
+          "importance_score_range": [0.6, 1.0],
+          "importance_increased": true
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    },
+    "purpose": "Verify that preference_agent uses recalculate_timer_importance_tool when user expresses category preferences",
+    "regression_for": "Preference agent doesn't recalculate importance of existing timers when preferences change"
   }
 ]

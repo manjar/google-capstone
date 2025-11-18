@@ -2,6 +2,10 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-dotenv==1.0.1
 google-generativeai==0.8.3
-google-adk
 google-cloud-aiplatform
 jinja2==3.1.2
+python-dateutil==2.9.0
+requests==2.32.3
+
+# google-adk must be installed separately:
+# pip install git+https://github.com/google/adk-python.git@main

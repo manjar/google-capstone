@@ -1,0 +1,4 @@
+# Local development environment variables
+
+# Add your API keys here:
+GEMINI_API_KEY=AIzaSyDPOsLirs6qVtIJMW8uqVGZU3Bii9H5uC4

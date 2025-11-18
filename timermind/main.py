@@ -31,6 +31,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY in .env file")
 
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+# Maps API is optional - location features will be disabled if not configured
+if not GOOGLE_MAPS_API_KEY:
+    logger.warning("GOOGLE_MAPS_API_KEY not found in .env - location-aware features will be disabled")
+
 # Paths
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -140,6 +145,23 @@ def init_database():
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Add location-aware fields for travel time calculations
+        location_columns = [
+            ("destination_address", "TEXT"),
+            ("origin_address", "TEXT"),
+            ("departure_time", "TEXT"),
+            ("arrival_time", "TEXT"),
+            ("travel_time_minutes", "INTEGER"),
+            ("distance_km", "REAL"),
+            ("last_travel_update", "TEXT"),
+            ("is_appointment", "INTEGER DEFAULT 0")  # 1 = fixed appointment, 0 = flexible task
+        ]
+        for col_name, col_type in location_columns:
+            try:
+                conn.execute(f"ALTER TABLE timers ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS preferences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +209,379 @@ MOCK_TODO_DATA = [
 # =============================================================================
 # Timer Operations (Tools will call these)
 # =============================================================================
+
+def detect_timeline_conflicts(
+    new_timer_data: dict,
+    existing_timers: Optional[list] = None
+) -> list[dict]:
+    """
+    Detect spatiotemporal conflicts between a new timer and existing timers.
+
+    Uses actual Google Maps travel times to detect impossible timelines.
+
+    Checks for:
+    1. Location conflicts - being at different locations at overlapping times
+    2. Travel time conflicts - insufficient time to travel between consecutive locations (uses real Maps API data)
+    3. Impossible timelines - need to leave before a previous event ends
+
+    Args:
+        new_timer_data: Dict with new timer info (label, deadline, destination_address,
+                       arrival_time, departure_time, etc.)
+        existing_timers: Optional list of existing timers (if None, fetches from DB)
+
+    Returns:
+        List of conflict dicts, each containing:
+        - type: "location_overlap", "insufficient_travel_time", or "impossible_timeline"
+        - description: Human-readable description
+        - conflicting_timer: The timer that conflicts
+        - severity: "critical" or "warning"
+        - actual_travel_time: Minutes needed (if calculated)
+        - time_available: Minutes available
+    """
+    from dateutil import parser as date_parser
+    from services.google_maps_service import get_maps_service
+
+    conflicts = []
+    maps_service = get_maps_service()
+
+    # Get existing timers if not provided
+    if existing_timers is None:
+        existing_timers = list_timers_from_db()
+
+    # Parse new timer times
+    new_deadline = new_timer_data.get('deadline')
+    new_arrival = new_timer_data.get('arrival_time')
+    new_departure = new_timer_data.get('departure_time')
+    new_destination = new_timer_data.get('destination_address')
+    new_label = new_timer_data.get('label', 'New timer')
+    new_duration_minutes = new_timer_data.get('estimated_duration_minutes', 0)
+
+    if not new_deadline and not new_arrival:
+        # No deadline, can't check conflicts
+        return conflicts
+
+    # Use arrival time if it's a location-based timer, otherwise use deadline
+    new_time_str = new_arrival or new_deadline
+
+    try:
+        new_time = date_parser.isoparse(new_time_str)
+        if new_departure:
+            new_departure_dt = date_parser.isoparse(new_departure)
+        else:
+            new_departure_dt = None
+
+        # Calculate end time for appointments/events with duration
+        # new_time is the start time (arrival or deadline)
+        # end time = start time + duration
+        from datetime import timedelta
+        new_end_time = new_time + timedelta(minutes=new_duration_minutes) if new_duration_minutes else new_time
+    except:
+        return conflicts
+
+    # Build timeline of all timers with times
+    timeline = []
+    for timer in existing_timers:
+        timer_deadline = timer.get('deadline')
+        timer_arrival = timer.get('arrival_time')
+        timer_departure = timer.get('departure_time')
+        timer_destination = timer.get('destination_address')
+        timer_duration_minutes = timer.get('estimated_duration_minutes', 0)
+
+        if not timer_deadline and not timer_arrival:
+            continue
+
+        # Use arrival time for location-based timers, deadline otherwise
+        timer_time_str = timer_arrival or timer_deadline
+        try:
+            timer_time = date_parser.isoparse(timer_time_str)
+            timer_departure_dt = date_parser.isoparse(timer_departure) if timer_departure else None
+            timer_arrival_dt = date_parser.isoparse(timer_arrival) if timer_arrival else None
+
+            # Calculate end time for appointments/events with duration
+            from datetime import timedelta
+            timer_end_time = timer_time + timedelta(minutes=timer_duration_minutes) if timer_duration_minutes else timer_time
+        except:
+            continue
+
+        timeline.append({
+            'timer': timer,
+            'time': timer_time,
+            'end_time': timer_end_time,
+            'duration_minutes': timer_duration_minutes,
+            'arrival_time': timer_arrival,
+            'arrival_dt': timer_arrival_dt,
+            'departure_time': timer_departure,
+            'departure_dt': timer_departure_dt,
+            'destination': timer_destination,
+            'label': timer.get('label', 'Timer')
+        })
+
+    # Sort timeline by time
+    timeline.sort(key=lambda x: x['time'])
+
+    # Check for conflicts with each existing timer
+    for timeline_item in timeline:
+        existing_timer = timeline_item['timer']
+        existing_time = timeline_item['time']
+        existing_end_time = timeline_item['end_time']
+        existing_duration = timeline_item['duration_minutes']
+        existing_destination = timeline_item['destination']
+        existing_label = timeline_item['label']
+        existing_arrival_dt = timeline_item['arrival_dt']
+        existing_departure_dt = timeline_item['departure_dt']
+
+        # Skip if neither timer has a location
+        if not new_destination and not existing_destination:
+            continue
+
+        # Check 1: Impossible timeline - need to depart before existing event ends
+        if existing_time < new_time and new_departure_dt:
+            # Existing event is before new event
+            # Check if we need to leave for new event before existing event completes
+            # Use end time if appointment has duration, otherwise use start time
+            if new_departure_dt < existing_end_time:
+                time_gap_minutes = (existing_end_time - new_departure_dt).total_seconds() / 60
+                duration_msg = f" (ends at {existing_end_time.strftime('%I:%M %p')})" if existing_duration else ""
+                conflicts.append({
+                    'type': 'impossible_timeline',
+                    'description': f"You need to leave for '{new_label}' at {new_departure_dt.strftime('%I:%M %p')}, but '{existing_label}'{duration_msg} doesn't finish until {existing_end_time.strftime('%I:%M %p')} ({int(abs(time_gap_minutes))} minutes later)",
+                    'conflicting_timer': existing_timer,
+                    'severity': 'critical',
+                    'time_available': -int(time_gap_minutes)  # Negative = impossible
+                })
+
+        # Check 2: Insufficient travel time using ACTUAL Maps API calculation
+        # After new event, check if there's time to get to existing event
+        if new_time < existing_time and new_destination and existing_destination and existing_departure_dt:
+            # New event is before existing event
+            # Calculate actual travel time from new destination to existing destination
+            # Use end time if new event has duration
+            time_available_minutes = (existing_departure_dt - new_end_time).total_seconds() / 60
+
+            # Only check if events are within reasonable time of each other (same day)
+            if time_available_minutes > 0 and time_available_minutes < 720:  # Within 12 hours
+                # Use Maps API to get actual travel time
+                if maps_service.is_enabled():
+                    result = maps_service.calculate_departure_time(
+                        origin=new_destination,
+                        destination=existing_destination,
+                        arrival_time=existing_time  # When we need to arrive at existing event
+                    )
+
+                    if result:
+                        _, actual_travel_minutes, _ = result
+
+                        # Check if we have enough time
+                        if time_available_minutes < actual_travel_minutes:
+                            shortfall = actual_travel_minutes - time_available_minutes
+                            new_duration_msg = f" ({new_duration_minutes} min duration, ends {new_end_time.strftime('%I:%M %p')})" if new_duration_minutes else f" (ends {new_end_time.strftime('%I:%M %p')})"
+                            conflicts.append({
+                                'type': 'insufficient_travel_time',
+                                'description': f"After '{new_label}' at {new_destination}{new_duration_msg}, you need to be at '{existing_label}' in {existing_destination} by {existing_departure_dt.strftime('%I:%M %p')}. Travel time is {int(actual_travel_minutes)} minutes, but you only have {int(time_available_minutes)} minutes available (short by {int(shortfall)} minutes)",
+                                'conflicting_timer': existing_timer,
+                                'severity': 'critical' if shortfall > 5 else 'warning',
+                                'actual_travel_time': int(actual_travel_minutes),
+                                'time_available': int(time_available_minutes)
+                            })
+
+        # Check 3: After existing event, check if there's time to get to new event
+        if existing_time < new_time and new_destination and existing_destination and new_departure_dt:
+            # Existing event is before new event
+            # Calculate actual travel time from existing destination to new destination
+            # Use end time if existing event has duration
+            time_available_minutes = (new_departure_dt - existing_end_time).total_seconds() / 60
+
+            # Only check if events are within reasonable time of each other
+            if time_available_minutes > 0 and time_available_minutes < 720:  # Within 12 hours
+                # Use Maps API to get actual travel time
+                if maps_service.is_enabled():
+                    result = maps_service.calculate_departure_time(
+                        origin=existing_destination,
+                        destination=new_destination,
+                        arrival_time=new_time  # When we need to arrive at new event
+                    )
+
+                    if result:
+                        _, actual_travel_minutes, _ = result
+
+                        # Check if we have enough time
+                        if time_available_minutes < actual_travel_minutes:
+                            shortfall = actual_travel_minutes - time_available_minutes
+                            existing_duration_msg = f" ({existing_duration} min duration, ends {existing_end_time.strftime('%I:%M %p')})" if existing_duration else f" (ends {existing_end_time.strftime('%I:%M %p')})"
+                            conflicts.append({
+                                'type': 'insufficient_travel_time',
+                                'description': f"After '{existing_label}' at {existing_destination}{existing_duration_msg}, you need to be at '{new_label}' in {new_destination} by {new_departure_dt.strftime('%I:%M %p')}. Travel time is {int(actual_travel_minutes)} minutes, but you only have {int(time_available_minutes)} minutes available (short by {int(shortfall)} minutes)",
+                                'conflicting_timer': existing_timer,
+                                'severity': 'critical' if shortfall > 5 else 'warning',
+                                'actual_travel_time': int(actual_travel_minutes),
+                                'time_available': int(time_available_minutes)
+                            })
+
+    return conflicts
+
+
+def detect_nearby_timers(
+    new_timer_data: dict,
+    existing_timers: Optional[list] = None,
+    proximity_window_hours: float = 3.0
+) -> list[dict]:
+    """
+    Detect timers that are temporally close to a new timer.
+
+    This function identifies "nearby" events that warrant location confirmation
+    to prevent potential conflicts. It flags cases where:
+    - Two timers are within proximity_window_hours of each other
+    - At least one has a location specified
+    - User should confirm locations are compatible
+
+    Args:
+        new_timer_data: Dict with 'label', 'deadline', 'destination_address', etc.
+        existing_timers: List of existing timer dicts to check against
+        proximity_window_hours: Time window (hours) to consider "nearby" (default: 3.0)
+
+    Returns:
+        List of proximity warnings with suggested confirmation questions
+    """
+    from dateutil import parser as date_parser
+
+    proximity_warnings = []
+
+    # Parse new timer data
+    new_label = new_timer_data.get('label', 'New timer')
+    new_deadline_str = new_timer_data.get('deadline')
+    new_destination = new_timer_data.get('destination_address')
+    new_arrival_str = new_timer_data.get('arrival_time')
+    new_departure_str = new_timer_data.get('departure_time')
+
+    if not new_deadline_str:
+        return proximity_warnings
+
+    try:
+        new_time = date_parser.isoparse(new_deadline_str)
+    except (ValueError, TypeError):
+        return proximity_warnings
+
+    # Determine the "event time" for the new timer (departure if location-based, else deadline)
+    new_event_time = new_time
+    if new_departure_str:
+        try:
+            new_event_time = date_parser.isoparse(new_departure_str)
+        except (ValueError, TypeError):
+            pass
+
+    # Fetch existing timers if not provided
+    if existing_timers is None:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute("""
+                SELECT id, label, deadline, destination_address, arrival_time, departure_time, status
+                FROM timers
+                WHERE status != 'completed'
+            """).fetchall()
+            existing_timers = [
+                {
+                    'id': row[0],
+                    'label': row[1],
+                    'deadline': row[2],
+                    'destination_address': row[3],
+                    'arrival_time': row[4],
+                    'departure_time': row[5],
+                    'status': row[6]
+                }
+                for row in rows
+            ]
+
+    proximity_window_minutes = proximity_window_hours * 60
+
+    for existing_timer in existing_timers:
+        existing_label = existing_timer.get('label', 'Existing timer')
+        existing_deadline = existing_timer.get('deadline')
+        existing_destination = existing_timer.get('destination_address')
+        existing_arrival = existing_timer.get('arrival_time')
+        existing_departure = existing_timer.get('departure_time')
+
+        if not existing_deadline:
+            continue
+
+        try:
+            existing_time = date_parser.isoparse(existing_deadline)
+        except (ValueError, TypeError):
+            continue
+
+        # Determine event time for existing timer
+        existing_event_time = existing_time
+        if existing_departure:
+            try:
+                existing_event_time = date_parser.isoparse(existing_departure)
+            except (ValueError, TypeError):
+                pass
+
+        # Calculate time difference
+        time_diff_minutes = abs((new_event_time - existing_event_time).total_seconds() / 60)
+
+        # Check if timers are within proximity window
+        if time_diff_minutes <= proximity_window_minutes:
+            # Only flag if at least one has a location
+            has_location = new_destination or existing_destination
+
+            if has_location:
+                # Build proximity warning
+                time_diff_hours = time_diff_minutes / 60
+
+                # Determine the relationship
+                if time_diff_minutes < 30:
+                    proximity_type = 'very_close'  # Less than 30 minutes apart
+                    severity = 'high'
+                elif time_diff_minutes < 120:
+                    proximity_type = 'close'  # 30 min to 2 hours
+                    severity = 'medium'
+                else:
+                    proximity_type = 'nearby'  # 2-3 hours
+                    severity = 'low'
+
+                # Format time information
+                if new_event_time < existing_event_time:
+                    order = f"{new_label} ({new_event_time.strftime('%I:%M %p')}) is {int(time_diff_minutes)} minutes before {existing_label} ({existing_event_time.strftime('%I:%M %p')})"
+                else:
+                    order = f"{new_label} ({new_event_time.strftime('%I:%M %p')}) is {int(time_diff_minutes)} minutes after {existing_label} ({existing_event_time.strftime('%I:%M %p')})"
+
+                # Create location summary
+                location_info = []
+                if new_destination:
+                    location_info.append(f"'{new_label}' is at {new_destination}")
+                else:
+                    location_info.append(f"'{new_label}' has no location specified")
+
+                if existing_destination:
+                    location_info.append(f"'{existing_label}' is at {existing_destination}")
+                else:
+                    location_info.append(f"'{existing_label}' has no location specified")
+
+                location_summary = ". ".join(location_info)
+
+                # Create suggested question
+                if new_destination and existing_destination:
+                    if new_destination.lower() == existing_destination.lower():
+                        suggested_question = f"Both events are at the same location ({new_destination}). Is this correct?"
+                    else:
+                        suggested_question = f"You have two events at different locations within {int(time_diff_hours)} hours. Can you confirm the locations are correct?"
+                elif new_destination and not existing_destination:
+                    suggested_question = f"'{new_label}' is at {new_destination}, but '{existing_label}' has no location. Where is '{existing_label}'?"
+                else:  # existing has location, new doesn't
+                    suggested_question = f"'{existing_label}' is at {existing_destination}, but '{new_label}' has no location. Where is '{new_label}'?"
+
+                proximity_warnings.append({
+                    'type': proximity_type,
+                    'severity': severity,
+                    'time_difference_minutes': int(time_diff_minutes),
+                    'nearby_timer': existing_timer,
+                    'order': order,
+                    'location_summary': location_summary,
+                    'suggested_question': suggested_question,
+                    'description': f"{order}. {location_summary}"
+                })
+
+    return proximity_warnings
+
 
 def compute_urgency_score(deadline_str: Optional[str], label: str = "", description: Optional[str] = None) -> tuple[float, str]:
     """
@@ -306,7 +701,7 @@ Task: {label}
 Description: {description or "N/A"}
 Category: {category}
 
-Please assess the importance score and provide your rationale. Remember to check user preferences for category weights."""
+Please assess the importance score and provide your rationale."""
 
     try:
         import google.generativeai as genai
@@ -400,15 +795,37 @@ def create_timer_in_db(
     deadline: Optional[str] = None,
     estimated_duration_minutes: Optional[int] = None,
     category: str = "other",
-    tags: list = None
+    tags: list = None,
+    destination_address: Optional[str] = None,
+    origin_address: Optional[str] = None,
+    departure_time: Optional[str] = None,
+    arrival_time: Optional[str] = None,
+    travel_time_minutes: Optional[int] = None,
+    distance_km: Optional[float] = None,
+    is_appointment: bool = False
 ) -> dict:
     """
     Create a new timer in the database.
 
     This function is called by the agent's create_timer tool.
+    Supports location-aware timers with travel time calculations.
+    Checks for timeline conflicts before creating.
     """
     tags_str = json.dumps(tags or [])
     now = datetime.utcnow().isoformat()
+
+    # Check for timeline conflicts BEFORE creating the timer
+    new_timer_data = {
+        'label': label,
+        'deadline': deadline,
+        'destination_address': destination_address,
+        'arrival_time': arrival_time,
+        'departure_time': departure_time
+    }
+    conflicts = detect_timeline_conflicts(new_timer_data)
+
+    # Check for nearby timers that warrant location confirmation
+    proximity_warnings = detect_nearby_timers(new_timer_data)
 
     # Compute scoring
     urgency, urgency_rationale = compute_urgency_score(deadline, label, description)
@@ -425,12 +842,17 @@ def create_timer_in_db(
             INSERT INTO timers (
                 label, description, deadline, estimated_duration_minutes,
                 category, tags, urgency_score, importance_score, priority_score,
-                rationale, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rationale, created_at, updated_at,
+                destination_address, origin_address, departure_time, arrival_time,
+                travel_time_minutes, distance_km, last_travel_update, is_appointment
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             label, description, deadline, estimated_duration_minutes,
             category, tags_str, urgency, importance, priority,
-            rationale, now, now
+            rationale, now, now,
+            destination_address, origin_address, departure_time, arrival_time,
+            travel_time_minutes, distance_km, now if destination_address else None,
+            1 if is_appointment else 0
         ))
         timer_id = cursor.lastrowid
 
@@ -444,6 +866,57 @@ def create_timer_in_db(
         "rationale": rationale,
         "status": "created"
     }
+
+    # Add location data to result if present
+    if destination_address:
+        result["destination_address"] = destination_address
+        result["origin_address"] = origin_address
+        result["departure_time"] = departure_time
+        result["arrival_time"] = arrival_time
+        result["travel_time_minutes"] = travel_time_minutes
+        result["distance_km"] = distance_km
+
+    # Add conflicts to result if any were detected
+    if conflicts:
+        result["conflicts"] = conflicts
+        result["has_conflicts"] = True
+        # Simplify conflicts for logging
+        conflict_summaries = [
+            {
+                'type': c['type'],
+                'severity': c['severity'],
+                'description': c['description']
+            }
+            for c in conflicts
+        ]
+        log_event("timer_created_with_conflicts", {
+            "timer_id": timer_id,
+            "label": label,
+            "conflicts": conflict_summaries
+        })
+    else:
+        result["has_conflicts"] = False
+
+    # Add proximity warnings to result if any were detected
+    if proximity_warnings:
+        result["proximity_warnings"] = proximity_warnings
+        result["has_proximity_warnings"] = True
+        # Simplify proximity warnings for logging
+        proximity_summaries = [
+            {
+                'type': w['type'],
+                'severity': w['severity'],
+                'suggested_question': w['suggested_question']
+            }
+            for w in proximity_warnings
+        ]
+        log_event("timer_created_with_proximity_warnings", {
+            "timer_id": timer_id,
+            "label": label,
+            "proximity_warnings": proximity_summaries
+        })
+    else:
+        result["has_proximity_warnings"] = False
 
     log_event("timer_created", result)
     return result
@@ -468,6 +941,9 @@ import google.generativeai as genai
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.memory import InMemoryMemoryService
+from google.adk.tools.load_memory_tool import LoadMemoryTool
+from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 from google.genai import types
 
 # Configure Gemini API
@@ -486,6 +962,13 @@ def create_timer_tool(
     deadline_iso: str = "",
     estimated_duration_minutes: int = 0,
     category: str = "other",
+    destination_address: str = "",
+    origin_address: str = "",
+    departure_time: str = "",
+    arrival_time: str = "",
+    travel_time_minutes: int = 0,
+    distance_km: float = 0.0,
+    is_appointment: bool = False
 ) -> dict:
     """
     Create a new timer/task in the system.
@@ -496,13 +979,22 @@ def create_timer_tool(
         deadline_iso: Optional deadline in ISO 8601 format (e.g., "2025-11-20T17:00:00")
         estimated_duration_minutes: Optional estimate of how long the task will take
         category: Task category - one of: work, personal, health, finance, maintenance, other
+        destination_address: Optional destination address for location-aware timers
+        origin_address: Optional origin address (defaults to user's home if not specified)
+        departure_time: Optional calculated departure time (ISO 8601 format)
+        arrival_time: Optional arrival time / deadline for location-based tasks
+        travel_time_minutes: Optional calculated travel time in minutes
+        distance_km: Optional calculated distance in kilometers
+        is_appointment: Whether this is a fixed appointment (True) or flexible task (False)
+                       Appointments are not easily reschedulable (dentist, meeting, pickup)
+                       Tasks can be moved to accommodate appointments (grocery, errands)
 
     Returns:
         dict with timer_id, computed scores, and creation status
     """
     log_event("tool_called", {
         "tool": "create_timer",
-        "args": {"label": label, "deadline_iso": deadline_iso, "category": category}
+        "args": {"label": label, "deadline_iso": deadline_iso, "category": category, "destination": destination_address}
     })
 
     result = create_timer_in_db(
@@ -511,7 +1003,14 @@ def create_timer_tool(
         deadline=deadline_iso if deadline_iso else None,
         estimated_duration_minutes=estimated_duration_minutes if estimated_duration_minutes > 0 else None,
         category=category,
-        tags=[]
+        tags=[],
+        destination_address=destination_address if destination_address else None,
+        origin_address=origin_address if origin_address else None,
+        departure_time=departure_time if departure_time else None,
+        arrival_time=arrival_time if arrival_time else None,
+        travel_time_minutes=travel_time_minutes if travel_time_minutes > 0 else None,
+        distance_km=distance_km if distance_km > 0.0 else None,
+        is_appointment=is_appointment
     )
     return result
 
@@ -564,6 +1063,7 @@ def update_timer_tool(timer_id: int, status: str = "", category: str = "", deadl
         updates = []
         params = []
         new_urgency = None
+        new_importance = None
 
         if status:
             updates.append("status = ?")
@@ -571,6 +1071,14 @@ def update_timer_tool(timer_id: int, status: str = "", category: str = "", deadl
         if category:
             updates.append("category = ?")
             params.append(category)
+            # Fetch timer info for importance scoring when category changes
+            timer_row = conn.execute("SELECT label, description FROM timers WHERE id = ?", (timer_id,)).fetchone()
+            if timer_row:
+                label, description = timer_row
+                # Recompute importance score with new category
+                new_importance, _ = compute_importance_score(category, label, description)
+                updates.append("importance_score = ?")
+                params.append(new_importance)
         if deadline_iso:
             updates.append("deadline = ?")
             params.append(deadline_iso)
@@ -582,9 +1090,21 @@ def update_timer_tool(timer_id: int, status: str = "", category: str = "", deadl
                 new_urgency, _ = compute_urgency_score(deadline_iso, label, description)
                 updates.append("urgency_score = ?")
                 params.append(new_urgency)
-                # Update priority score (simple average for now)
-                updates.append("priority_score = (? + importance_score) / 2")
-                params.append(new_urgency)
+
+        # Recalculate priority if either urgency or importance changed
+        if new_urgency is not None or new_importance is not None:
+            # Need to fetch current scores to calculate priority
+            current = conn.execute(
+                "SELECT urgency_score, importance_score FROM timers WHERE id = ?",
+                (timer_id,)
+            ).fetchone()
+            if current:
+                urgency = new_urgency if new_urgency is not None else current[0]
+                importance = new_importance if new_importance is not None else current[1]
+                # Use correct weighted priority: urgency * 0.6 + importance * 0.4
+                priority = (urgency * 0.6) + (importance * 0.4)
+                updates.append("priority_score = ?")
+                params.append(priority)
 
         if updates:
             updates.append("updated_at = ?")
@@ -595,9 +1115,104 @@ def update_timer_tool(timer_id: int, status: str = "", category: str = "", deadl
     result = {"timer_id": timer_id, "updated": True}
     if new_urgency is not None:
         result["new_urgency_score"] = new_urgency
+    if new_importance is not None:
+        result["new_importance_score"] = new_importance
+    if deadline_iso:
         result["deadline"] = deadline_iso
 
     return result
+
+def calculate_travel_time_tool(
+    destination: str,
+    arrival_time_iso: str,
+    origin: str = ""
+) -> dict:
+    """
+    Calculate travel time and recommended departure time for a location-based timer.
+
+    Args:
+        destination: Destination address (e.g., "Naschmarkt, Campbell, CA")
+        arrival_time_iso: When you need to arrive (ISO 8601 format)
+        origin: Optional origin address (defaults to user's home address from preferences)
+
+    Returns:
+        dict with travel_time_minutes, distance_km, departure_time_iso, origin_address, destination_address
+        or error message if Maps API not configured or calculation fails
+    """
+    from services.google_maps_service import get_maps_service
+    from dateutil import parser as date_parser
+
+    log_event("tool_called", {
+        "tool": "calculate_travel_time",
+        "destination": destination,
+        "arrival_time": arrival_time_iso
+    })
+
+    maps_service = get_maps_service()
+
+    if not maps_service.is_enabled():
+        return {
+            "success": False,
+            "error": "Location features not available - GOOGLE_MAPS_API_KEY not configured",
+            "travel_time_minutes": 0,
+            "distance_km": 0.0
+        }
+
+    # Get origin (default to user's home if not specified)
+    if not origin:
+        # Try to get default location from preferences
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT value FROM preferences WHERE key = ?",
+                ("default_location",)
+            ).fetchone()
+            if row:
+                origin = json.loads(row[0])
+            else:
+                return {
+                    "success": False,
+                    "error": "No origin specified and no default location set in preferences",
+                    "travel_time_minutes": 0,
+                    "distance_km": 0.0
+                }
+
+    # Parse arrival time
+    try:
+        arrival_time = date_parser.isoparse(arrival_time_iso)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Invalid arrival_time format: {e}",
+            "travel_time_minutes": 0,
+            "distance_km": 0.0
+        }
+
+    # Calculate travel time
+    result = maps_service.calculate_departure_time(
+        origin=origin,
+        destination=destination,
+        arrival_time=arrival_time
+    )
+
+    if not result:
+        return {
+            "success": False,
+            "error": f"Could not calculate route from '{origin}' to '{destination}'",
+            "travel_time_minutes": 0,
+            "distance_km": 0.0
+        }
+
+    departure_time, travel_minutes, distance_km = result
+
+    return {
+        "success": True,
+        "travel_time_minutes": travel_minutes,
+        "distance_km": distance_km,
+        "departure_time_iso": departure_time.isoformat(),
+        "arrival_time_iso": arrival_time_iso,
+        "origin_address": origin,
+        "destination_address": destination
+    }
 
 # Preference Management Tools (for Preference Agent)
 def get_user_preferences_tool() -> dict:
@@ -618,49 +1233,10 @@ def get_user_preferences_tool() -> dict:
     # Return defaults if no preferences set
     if not prefs:
         prefs = {
-            "category_weights": {
-                "work": 1.0,
-                "personal": 0.8,
-                "health": 1.2,
-                "finance": 1.1,
-                "maintenance": 0.7,
-                "other": 0.5
-            },
             "rules": []
         }
 
     return {"preferences": prefs}
-
-def update_category_weight_tool(category: str, weight: float) -> dict:
-    """
-    Update the priority weight for a specific category.
-
-    Higher weights mean tasks in that category are considered more important.
-
-    Args:
-        category: Category name (work, personal, health, finance, maintenance, other)
-        weight: New weight value (0.1 to 2.0, where 1.0 is neutral)
-
-    Returns:
-        dict with update confirmation
-    """
-    log_event("tool_called", {"tool": "update_category_weight", "category": category, "weight": weight})
-
-    # Get current weights
-    prefs = get_user_preferences_tool()["preferences"]
-    weights = prefs.get("category_weights", {})
-    weights[category] = max(0.1, min(2.0, weight))  # Clamp to valid range
-
-    # Save to database
-    now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT INTO preferences (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
-        """, ("category_weights", json.dumps(weights), now, json.dumps(weights), now))
-
-    return {"category": category, "new_weight": weights[category], "updated": True}
 
 def add_preference_rule_tool(rule_description: str, rule_type: str, condition: str, action: str) -> dict:
     """
@@ -702,6 +1278,89 @@ def add_preference_rule_tool(rule_description: str, rule_type: str, condition: s
         """, ("rules", json.dumps(rules), now, json.dumps(rules), now))
 
     return {"rule_id": new_rule["id"], "description": rule_description, "created": True}
+
+def recalculate_timer_importance_tool(timer_id: int) -> dict:
+    """
+    Recalculate the importance score for an existing timer.
+
+    This is useful when user preferences have changed and you want to update
+    the importance of existing timers to reflect new priorities.
+
+    Args:
+        timer_id: ID of the timer to recalculate importance for
+
+    Returns:
+        dict with timer_id, old and new importance scores, and updated priority
+    """
+    log_event("tool_called", {"tool": "recalculate_timer_importance", "timer_id": timer_id})
+
+    with sqlite3.connect(DB_PATH) as conn:
+        # Fetch timer data
+        timer_row = conn.execute(
+            "SELECT label, description, category, urgency_score, importance_score FROM timers WHERE id = ?",
+            (timer_id,)
+        ).fetchone()
+
+        if not timer_row:
+            return {
+                "success": False,
+                "error": f"Timer {timer_id} not found"
+            }
+
+        label, description, category, old_urgency, old_importance = timer_row
+
+        # Recalculate importance score
+        new_importance, importance_rationale = compute_importance_score(category, label, description)
+
+        # Recalculate priority with correct weighting
+        new_priority = (old_urgency * 0.6) + (new_importance * 0.4)
+
+        # Update database
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            UPDATE timers
+            SET importance_score = ?, priority_score = ?, updated_at = ?
+            WHERE id = ?
+        """, (new_importance, new_priority, now, timer_id))
+
+    return {
+        "timer_id": timer_id,
+        "old_importance_score": old_importance,
+        "new_importance_score": new_importance,
+        "new_priority_score": new_priority,
+        "rationale": importance_rationale,
+        "updated": True
+    }
+
+def set_default_location_tool(address: str) -> dict:
+    """
+    Set the user's default location (home address) for location-aware timers.
+
+    This address will be used as the default origin for travel time calculations
+    when no origin is specified.
+
+    Args:
+        address: Full address of user's home/default location (e.g., "123 Main St, Campbell, CA 95008")
+
+    Returns:
+        dict with confirmation of location being set
+    """
+    log_event("tool_called", {"tool": "set_default_location", "address": address})
+
+    # Save to database
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO preferences (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+        """, ("default_location", json.dumps(address), now, json.dumps(address), now))
+
+    return {
+        "success": True,
+        "message": f"Default location set to: {address}",
+        "location": address
+    }
 
 # Scoring Tools (for Importance and Urgency Agents)
 # Global variables to store agent scoring results
@@ -763,7 +1422,7 @@ def submit_urgency_score_tool(urgency_score: float, rationale: str) -> dict:
 # Importance Scoring Agent - Analyzes task importance
 importance_agent = Agent(
     name="importance_agent",
-    model="gemini-2.0-flash-exp",
+    model="gemini-2.5-flash",
     description="Analyzes task importance based on context, keywords, and category",
     instruction="""
 You are the Importance Scoring Agent. Your ONLY job is to assess how important a task is, independent of its deadline urgency.
@@ -800,7 +1459,7 @@ Once you determine the score, call submit_importance_score_tool with your score 
 # Urgency Scoring Agent - Analyzes task urgency based on deadline
 urgency_agent = Agent(
     name="urgency_agent",
-    model="gemini-2.0-flash-exp",
+    model="gemini-2.5-flash",
     description="Analyzes task urgency based on deadline and time pressure",
     instruction="""
 You are the Urgency Scoring Agent. Your ONLY job is to assess how urgent a task is based on deadline AND task complexity/effort.
@@ -849,73 +1508,10 @@ Once you determine the score, call submit_urgency_score_tool with your score and
     tools=[submit_urgency_score_tool]
 )
 
-# Context Resolution Agent - Maps natural language to existing timer data
-context_agent = Agent(
-    name="context_agent",
-    model="gemini-2.0-flash-exp",
-    description="Resolves natural language references to existing timers and their data",
-    instruction="""
-You are the Context Resolution Agent. Your ONLY job is to map natural language task references to existing timer data.
-
-When given a query about existing tasks:
-1. ALWAYS call get_current_timers_tool first
-2. Find timers that match the natural language references
-3. Return the relevant timer details (especially deadlines)
-
-Examples:
-- "getting the mail" → Look for timer with "mail" in label, return its deadline
-- "picking up Willem" → Look for timer with "Willem" in label, return its deadline
-- "the report" → Look for timer with "report" in label, return its deadline
-- "between X and Y" → Find both timers, return both deadlines so caller can calculate middle time
-
-You must be fuzzy-matching friendly:
-- "getting the mail" matches "Get mail from mailbox"
-- "picking up willem" matches "Pick up Willem"
-- "my appointment" matches "Doctor appointment" or "Dentist appointment"
-
-Return structured data about the matched timers including their IDs, labels, and deadlines.
-If no match is found, clearly state that.
-""",
-    tools=[get_current_timers_tool]
-)
-
-# Planning Agent - Creates and tracks execution plans
-planning_agent = Agent(
-    name="planning_agent",
-    model="gemini-2.0-flash-exp",
-    description="Creates step-by-step execution plans and ensures all steps are completed",
-    instruction="""
-You are the Planning Agent. Your job is to EXECUTE multi-step tasks to completion.
-
-IMPORTANT: Do NOT output a plan first. Instead:
-1. Internally plan the steps needed
-2. IMMEDIATELY start executing by calling tools
-3. Only report results AFTER all steps are done
-
-For "between getting the mail and picking up willem, I need lunch":
-1. Call get_current_timers_tool to find the mail and willem timers
-2. Extract their deadlines from the results
-3. Calculate midpoint: if mail=13:39 and willem=14:44, midpoint is ~14:11
-4. Call create_timer_tool with label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal"
-5. Report: "Created Lunch timer at 14:11 (between mail at 13:39 and Willem at 14:44)"
-
-YOU MUST:
-- Call tools immediately, don't just describe what you would do
-- Use the ACTUAL data from tool results
-- Complete ALL steps before responding
-- End with the final action (create/update/delete) being executed
-- Report what you accomplished, not what you plan to do
-
-If you need to resolve task references, delegate to context_agent first, then use those results.
-""",
-    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool],
-    sub_agents=[context_agent]
-)
-
 # Extraction Agent - Specializes in parsing tasks from natural language
 extraction_agent = Agent(
     name="extraction_agent",
-    model="gemini-2.0-flash-exp",
+    model="gemini-2.5-flash",
     description="Extracts structured timer/task information from natural language input",
     instruction="""
 You are the Extraction Agent, specialized in parsing task information from natural language.
@@ -927,21 +1523,229 @@ Your job is to:
 4. Update existing timers if they match, or create new ones
 
 IMPORTANT WORKFLOW:
-1. If user references existing tasks by name (e.g., "between getting the mail and picking up willem"), DELEGATE to context_agent first to resolve those references to actual timer data
-2. Once you have the timer data (deadlines, IDs), YOU MUST USE THAT DATA to complete the task - DO NOT just report what you found
-3. ALWAYS finish by creating/updating/deleting the timer as requested
-4. Call get_current_timers_tool to see what tasks exist if needed
-5. If user mentions a task that matches an existing active timer, UPDATE it
-6. If user references a recently completed task, use that info to CREATE a new one
+1. ALWAYS call get_current_timers_tool FIRST to see what tasks exist
+2. If user references existing tasks (e.g., "between X and Y", "after the meeting"), look them up by matching keywords in the timer labels
+3. Use the actual timer data (deadlines, IDs) to complete the requested action
+4. If user mentions a task that matches an existing active timer, UPDATE it
+5. If creating a new task, use create_timer_tool
+6. Always finish by taking the requested action (create/update/delete)
 
-CRITICAL: After getting context data, you MUST take action. Example:
-- User says: "between getting the mail and picking up willem, I need lunch"
-- Step 1: DELEGATE to context_agent → returns mail deadline (13:39) and willem deadline (14:44)
-- Step 2: Calculate midpoint: (13:39 + 14:44) / 2 ≈ 14:11
-- Step 3: CALL create_timer_tool with label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal"
-- Step 4: Report success to user
+CRITICAL: You MUST call create_timer_tool or update_timer_tool to complete the task. Never just report data without acting on it.
 
-You MUST call create_timer_tool or update_timer_tool to complete the task. Never just report data without acting on it.
+Example - "between getting the mail and picking up willem, I need lunch":
+1. Call get_current_timers_tool → find "mail" timer (deadline 13:39) and "Willem" timer (deadline 14:44)
+2. Calculate midpoint: (13:39 + 14:44) / 2 ≈ 14:11
+3. Call create_timer_tool(label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal")
+4. Report success to user
+
+LOCATION-AWARE TIMERS (CRITICAL - READ CAREFULLY):
+
+WHEN TO USE calculate_travel_time_tool:
+Use this tool whenever the user mentions:
+- Going TO a location ("go to", "be at", "arrive at", "get to")
+- Leaving FOR a location ("leave for", "leave to be at", "head to", "drive to")
+- A specific address or place name WITH a time constraint
+- Examples that REQUIRE calculate_travel_time_tool:
+  * "leave to be at 4984 El Camino Real by 3:55pm"
+  * "go to Naschmarkt in Campbell at 3pm"
+  * "arrive at the dentist by 2pm"
+  * "be at the office by 9am"
+  * "get to the store by 5pm"
+
+CRITICAL: If you see ANY address or location WITH a time, you MUST use calculate_travel_time_tool FIRST.
+The timer deadline should be the DEPARTURE time (when to leave), NOT the arrival time!
+
+WORKFLOW:
+1. Identify the destination address from the message
+2. Identify the arrival time (when they need to BE THERE)
+3. Call calculate_travel_time_tool(destination="address", arrival_time_iso="ISO datetime")
+   - This calculates travel time with traffic and returns the DEPARTURE time
+4. Create timer using the DEPARTURE time as deadline:
+   - create_timer_tool(
+       label="Leave for [destination]",
+       deadline_iso=<departure_time_iso from calculate_travel_time_tool result>,
+       destination_address=<destination>,
+       origin_address=<origin from result>,
+       departure_time=<departure_time_iso>,
+       arrival_time=<arrival_time_iso>,
+       travel_time_minutes=<travel_time from result>,
+       distance_km=<distance from result>
+     )
+
+Example - "leave to be at 4984 El Camino Real, Los Altos by 3:55pm":
+1. Call calculate_travel_time_tool(
+     destination="4984 El Camino Real, Ste 208, Los Altos, CA",
+     arrival_time_iso="2025-11-18T15:55:00"
+   )
+2. Get result: {{
+     "departure_time_iso": "2025-11-18T15:30:00",  # When to LEAVE
+     "arrival_time_iso": "2025-11-18T15:55:00",    # When to ARRIVE
+     "travel_time_minutes": 25,
+     "distance_km": 12.3,
+     "origin_address": "San Jose, CA",
+     "destination_address": "4984 El Camino Real, Ste 208, Los Altos, CA"
+   }}
+3. Call create_timer_tool(
+     label="Leave for El Camino Real",
+     deadline_iso="2025-11-18T15:30:00",  # DEPARTURE time, NOT arrival time!
+     category="personal",
+     destination_address="4984 El Camino Real, Ste 208, Los Altos, CA",
+     origin_address="San Jose, CA",
+     departure_time="2025-11-18T15:30:00",
+     arrival_time="2025-11-18T15:55:00",
+     travel_time_minutes=25,
+     distance_km=12.3
+   )
+
+Example - "remind me to leave for the dentist in Campbell by 2pm":
+1. Call calculate_travel_time_tool(destination="Dentist, Campbell, CA", arrival_time_iso="2025-11-17T14:00:00")
+2. Get result: departure_time_iso="2025-11-17T13:35:00", travel_time=25 minutes, distance=12.3 km
+3. Call create_timer_tool(
+     label="Leave for dentist",
+     deadline_iso="2025-11-17T13:35:00",  # DEPARTURE time
+     category="health",
+     destination_address="Dentist, Campbell, CA",
+     departure_time="2025-11-17T13:35:00",
+     arrival_time="2025-11-17T14:00:00",
+     travel_time_minutes=25,
+     distance_km=12.3
+   )
+
+TIMELINE CONFLICT DETECTION:
+
+When you create a timer, the system automatically checks for spatiotemporal conflicts.
+The create_timer_tool response will include "has_conflicts" and "conflicts" fields.
+
+If conflicts are detected, you MUST:
+1. Still create the timer (it's already been created)
+2. Alert the user about the conflicts
+3. Explain each conflict clearly
+4. Suggest solutions if possible
+
+Conflict Types:
+- **location_overlap**: Different locations at nearly the same time
+- **impossible_timeline**: Need to leave before an earlier event ends
+- **insufficient_travel_time**: Not enough time to travel between locations
+
+Example Response with Conflicts:
+```
+Timer created: "Leave for Campbell meeting" at 2:30 PM
+
+⚠️ TIMELINE CONFLICT DETECTED:
+You have "Dentist in Los Altos" ending at 2:45 PM, but you need to leave for Campbell at 2:30 PM.
+This timeline is impossible - you would need to leave 15 minutes before the dentist appointment ends.
+
+Suggestion: Reschedule the dentist appointment earlier, or move the Campbell meeting later.
+```
+
+IMPORTANT: Always report conflicts to the user in a clear, actionable way. Don't ignore them!
+
+PROXIMITY WARNINGS (Location Confirmation):
+
+When you create a timer, the system also checks for "nearby" events (within 3 hours).
+The create_timer_tool response will include "has_proximity_warnings" and "proximity_warnings" fields.
+
+Proximity warnings help prevent conflicts by proactively asking about locations when events are close in time.
+
+If proximity warnings are detected, you SHOULD:
+1. Acknowledge the timer was created
+2. Note the nearby event(s)
+3. Ask the user the suggested_question to confirm locations are compatible
+
+Warning Types by Severity:
+- **very_close** (< 30 min apart): High severity - ask immediately
+- **close** (30 min - 2 hours apart): Medium severity - confirm location
+- **nearby** (2-3 hours apart): Low severity - mention if relevant
+
+Example Response with Proximity Warning:
+```
+Timer created: "Meeting" at 2:00 PM
+
+📍 LOCATION CHECK:
+You have "Dentist appointment" at 3:30 PM (90 minutes later).
+- 'Meeting' has no location specified
+- 'Dentist appointment' is at 123 Main St, Campbell
+
+Where is the meeting? This will help me check if you have enough travel time between events.
+```
+
+IMPORTANT: Use proximity warnings to help the user avoid conflicts before they happen!
+
+APPOINTMENT vs TASK DETECTION:
+
+When creating a timer, you must determine if it's a **fixed appointment** or a **flexible task**.
+This distinction is critical for intelligent conflict resolution - the system can reschedule flexible tasks to accommodate fixed appointments.
+
+Set `is_appointment=True` for:
+- **Fixed time commitments** that can't be easily rescheduled:
+  * Medical appointments (dentist, doctor, specialist)
+  * Scheduled meetings (work meetings, video calls, appointments)
+  * Pickup/dropoff obligations (pick up Willem, get kids from school)
+  * Classes or lessons (piano lesson, yoga class, webinar)
+  * Reservations (restaurant, tickets, haircut)
+  * Scheduled events (conference, party, wedding)
+
+- **Indicators of appointments**:
+  * Specific times mentioned ("at 2:30PM", "at exactly 3:00")
+  * Appointment-related keywords (appointment, meeting, scheduled, reservation)
+  * Other people involved (meeting with X, pick up Y)
+  * Professional services (dentist, doctor, lawyer, mechanic)
+
+Set `is_appointment=False` for:
+- **Flexible tasks** that can be rescheduled:
+  * Personal errands (grocery store, pharmacy, post office)
+  * Household chores (clean room, do laundry, organize closet)
+  * Self-directed tasks (study, practice, exercise, read)
+  * Vague timing ("tomorrow", "this week", "when I can")
+  * No specific time commitment
+
+Examples:
+- "I need to go to the dentist at 2:30PM" → is_appointment=True (fixed time, professional service)
+- "Pick up Willem at 3:00PM" → is_appointment=True (pickup obligation, specific time)
+- "Meeting with Sarah at 10am" → is_appointment=True (scheduled meeting, other person)
+- "I need to go to the grocery store tomorrow" → is_appointment=False (flexible errand, vague timing)
+- "Clean my room this week" → is_appointment=False (household chore, no specific time)
+- "Leave for the gym around 6pm" → is_appointment=False ("around" = flexible timing)
+
+When in doubt:
+- If rescheduling would require contacting someone else or canceling → is_appointment=True
+- If you can do it whenever you want → is_appointment=False
+
+IMPORTANT: Always set the is_appointment parameter when calling create_timer_tool!
+
+APPOINTMENT DURATION EXTRACTION:
+
+For appointments, ALWAYS extract and set the `estimated_duration_minutes` parameter.
+This is critical for accurate conflict detection - the system needs to know when appointments END to calculate travel time.
+
+**How to extract duration:**
+- **Explicit duration mentioned:**
+  * "Dentist appointment at 2:30pm for 1 hour" → estimated_duration_minutes=60
+  * "30 minute meeting at 10am" → estimated_duration_minutes=30
+  * "Dinner from 6pm to 7:30pm" → estimated_duration_minutes=90
+  * "2 hour workshop starting at 1pm" → estimated_duration_minutes=120
+
+- **Typical appointment durations (when not specified):**
+  * Doctor/Dentist: 30-60 minutes (use 45 as default)
+  * Haircut: 30-45 minutes (use 30 as default)
+  * Meeting: 30-60 minutes (use 60 as default)
+  * Dinner/Lunch: 60-90 minutes (use 75 as default)
+  * Class/Lesson: 60 minutes (use 60 as default)
+
+- **For tasks (not appointments):**
+  * Use estimated_duration_minutes if user specifies effort required
+  * Otherwise, leave as 0 or omit
+
+**Examples:**
+```
+"Dentist at 2:30pm" → is_appointment=True, estimated_duration_minutes=45
+"30 minute standup at 9am" → is_appointment=True, estimated_duration_minutes=30
+"Dinner at Outback at 7pm" → is_appointment=True, estimated_duration_minutes=75
+"Pick up Willem at 3pm" → is_appointment=True, estimated_duration_minutes=5
+"Clean room tomorrow" → is_appointment=False, estimated_duration_minutes=0 (or omit)
+```
+
+IMPORTANT: Always set estimated_duration_minutes for appointments to enable accurate conflict detection!
 
 RECURRING/MULTIPLE TIMERS:
 If user requests recurring tasks or multiple instances, you MUST create MULTIPLE separate timers by calling create_timer_tool multiple times:
@@ -983,43 +1787,74 @@ Return a clear summary of what you did (created, updated, or deleted).
         today=datetime.now().strftime("%A, %B %d, %Y"),
         current_time=datetime.now().strftime("%H:%M")
     ),
-    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool]
+    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool, calculate_travel_time_tool]
 )
 
-# Preference Agent - Specializes in learning user preferences
+# Memory & Learning Agent - Learns user preferences and notable facts
+# Instantiate memory tools
+load_memory = LoadMemoryTool()
+preload_memory = PreloadMemoryTool()
+
 preference_agent = Agent(
     name="preference_agent",
-    model="gemini-2.0-flash-exp",
-    description="Learns and manages user preferences for task prioritization",
+    model="gemini-2.5-flash",
+    description="Learns and remembers user preferences, context, and notable facts",
     instruction="""
-You are the Preference Agent, specialized in learning user preferences.
+You are the Memory & Learning Agent. You learn and remember everything notable about the user.
 
-Your job is to:
-1. Identify preference signals in user messages
-2. Update category weights based on user statements
-3. Create rules for special prioritization logic
+Your responsibilities:
+1. **Preferences**: Prioritization rules and category importance
+2. **Notable Facts**: Any important information about the user
+3. **Context**: Schedule patterns, recurring events, life circumstances
+4. **Patterns**: User behaviors and tendencies
+5. **Updating Existing Timers**: When preferences change, update relevant existing timers
 
-Listen for statements like:
-- "Work is more important than personal stuff" → increase work weight
-- "Health should always come first" → set health weight to highest
-- "Don't bother me with work on weekends" → add suppression rule
-- "Bills are high priority" → increase finance weight
+STORE NOTABLE FACTS using load_memory including:
+- Schedule patterns ("usually works until 6 PM", "kids' pickup at 3 PM")
+- Recurring events ("dentist every 6 months", "team meeting Mondays")
+- Important context ("preparing for presentation next week", "on vacation Dec 20-27")
+- Task patterns ("tends to underestimate cooking time")
+- Life circumstances ("works from home", "has two kids")
+- Communication preferences
+- Category importance preferences ("health is priority", "work not important on weekends")
+- Location information: Use set_default_location_tool when user mentions their home address
 
-Weight scale (0.1 to 2.0):
-- 0.1-0.5: Low priority
-- 0.6-0.9: Below average
-- 1.0: Neutral/average
-- 1.1-1.5: Above average
-- 1.6-2.0: High priority
+RETRIEVE RELEVANT FACTS using preload_memory to:
+- Inform better prioritization decisions
+- Avoid asking questions you should already know
+- Provide personalized, context-aware responses
 
-When updating preferences:
-1. Get current preferences first
-2. Make incremental adjustments (don't overhaul everything)
-3. Confirm changes with the user
+UPDATING EXISTING TIMERS when preferences change:
+When a user expresses that a category is important (e.g., "health is really important to me"):
+1. Store the preference using load_memory
+2. Use get_current_timers_tool to find active timers in that category
+3. For each relevant timer, use recalculate_timer_importance_tool to update its importance score
+4. Report back to the user which timers were updated
 
-Be conversational and confirm what you've learned.
+Example workflow:
+User: "The El Camino Real trip is health-related, and health is really important to me."
+1. Store: load_memory("User prioritizes health-related tasks highly")
+2. Find timers: get_current_timers_tool() → find timer with "El Camino Real" (category: health)
+3. Update importance: recalculate_timer_importance_tool(timer_id=X)
+4. Respond: "I've noted that health is very important to you, and I've updated the importance of your El Camino Real appointment accordingly."
+
+When learning:
+1. Retrieve existing memories/preferences first using preload_memory
+2. Store new notable facts immediately using load_memory
+3. Update existing timers if the preference relates to importance/priority
+4. Be conversational and confirm what you've learned
+
+Remember: ANY notable fact is worth storing - don't just focus on preferences!
 """,
-    tools=[get_user_preferences_tool, update_category_weight_tool, add_preference_rule_tool]
+    tools=[
+        get_user_preferences_tool,
+        add_preference_rule_tool,
+        set_default_location_tool,
+        get_current_timers_tool,
+        recalculate_timer_importance_tool,
+        load_memory,
+        preload_memory
+    ]
 )
 
 # =============================================================================
@@ -1028,15 +1863,14 @@ Be conversational and confirm what you've learned.
 
 root_agent = Agent(
     name="timermind_orchestrator",
-    model="gemini-2.0-flash-exp",
+    model="gemini-2.5-flash",
     description="Orchestrates task extraction and preference learning for TimerMind",
     instruction="""
 You are TimerMind, the main orchestrator agent for personal task prioritization.
 
-You have three specialized sub-agents:
-1. **planning_agent**: For complex, multi-step requests that need planning and execution tracking
-2. **extraction_agent**: For simple, direct task operations (create, update, delete)
-3. **preference_agent**: Learns user preferences for prioritization
+You have two specialized sub-agents:
+1. **extraction_agent**: Handles all timer operations (create, update, delete, query)
+2. **preference_agent**: Learns user preferences for prioritization
 
 Your job is to:
 1. Understand what the user wants
@@ -1044,47 +1878,55 @@ Your job is to:
 3. Synthesize responses and provide a unified experience
 
 Delegation guidelines:
-- If request involves references to OTHER tasks (e.g., "between X and Y", "after the meeting") → delegate to planning_agent
-- If request needs multiple steps or calculations → delegate to planning_agent
-- If user describes a simple new task with explicit deadline → delegate to extraction_agent
-- If user wants to UPDATE/COMPLETE/DELETE a task by name → delegate to extraction_agent
+- If request involves ANY timer operations (create, update, delete, query) → delegate to extraction_agent
 - If user expresses preferences/priorities/importance → delegate to preference_agent
-- If user asks about current timers → use get_current_timers_tool directly
+- If user just wants to see current timers → you can use get_current_timers_tool directly OR delegate to extraction_agent
+
+The extraction_agent is smart enough to handle:
+- Simple new tasks with explicit deadlines
+- Fuzzy references ("that report", "it", "the meeting")
+- Multi-task references ("between X and Y", "after the meeting")
+- Updates using timer IDs
+- Complex multi-step task creation
 
 Examples:
-- "I need to pick up Willem at 3pm" → extraction_agent (simple, explicit)
-- "Between getting the mail and picking up Willem, I need lunch" → planning_agent (references other tasks, needs calculation)
+- "I need to pick up Willem at 3pm" → extraction_agent
+- "Change that report deadline to Thursday" → extraction_agent
+- "Between getting the mail and picking up Willem, I need lunch" → extraction_agent
 - "Health is my top priority" → preference_agent
-- "Mark the report as done" → extraction_agent (simple update)
+- "Update timer_id 42 to be due tomorrow" → extraction_agent
+- "What timers do I have?" → get_current_timers_tool OR extraction_agent
 
-IMPORTANT: Use planning_agent for anything that requires looking up existing timer data and then acting on it.
+Keep it simple: timers → extraction_agent, preferences → preference_agent.
 
 Today is {today}.
 """.format(today=datetime.now().strftime("%A, %B %d, %Y")),
     tools=[get_current_timers_tool],
-    sub_agents=[planning_agent, extraction_agent, preference_agent]
+    sub_agents=[extraction_agent, preference_agent]
 )
 
-# Create session service (using InMemory for now, will upgrade to VertexAI later)
+# Create session and memory services (Google ADK)
+# Session: conversation history (using InMemory for demo, can upgrade to persistent)
+# Memory: long-term facts, preferences, learned information
 session_service = InMemorySessionService()
+memory_service = InMemoryMemoryService()
 
 # Create runner for agent execution
 runner = Runner(
     agent=root_agent,
     app_name="timermind",
-    session_service=session_service
+    session_service=session_service,
+    memory_service=memory_service
 )
 
 log_event("adk_multi_agent_initialized", {
     "root_agent": "timermind_orchestrator",
-    "sub_agents": ["planning_agent", "extraction_agent", "preference_agent"],
-    "planning_sub_agents": ["context_agent"],
-    "planning_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool"],
-    "extraction_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool"],
-    "context_tools": ["get_current_timers_tool"],
-    "preference_tools": ["get_user_preferences_tool", "update_category_weight_tool", "add_preference_rule_tool"],
+    "sub_agents": ["extraction_agent", "preference_agent"],
+    "extraction_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool", "calculate_travel_time_tool"],
+    "preference_tools": ["get_user_preferences_tool", "add_preference_rule_tool", "set_default_location_tool", "get_current_timers_tool", "recalculate_timer_importance_tool", "load_memory", "preload_memory"],
     "session_service": "InMemorySessionService",
-    "model": "gemini-2.0-flash-exp"
+    "memory_service": "InMemoryMemoryService (Google ADK memory banks)",
+    "model": "gemini-2.5-flash"
 })
 
 # =============================================================================
@@ -1228,23 +2070,24 @@ async def chat(request: ChatRequest):
             if hasattr(event, "content") and event.content:
                 # Check for function calls in parts
                 has_function_call = False
-                for part in event.content.parts:
-                    # Extract function call information
-                    if hasattr(part, "function_call") and part.function_call:
-                        has_function_call = True
-                        trace_event["event_category"] = "tool-call"
-                        trace_event["tool_name"] = part.function_call.name
-                        if hasattr(part.function_call, "args") and part.function_call.args:
-                            trace_event["tool_args"] = str(part.function_call.args)[:200]
+                if hasattr(event.content, "parts") and event.content.parts:
+                    for part in event.content.parts:
+                        # Extract function call information
+                        if hasattr(part, "function_call") and part.function_call:
+                            has_function_call = True
+                            trace_event["event_category"] = "tool-call"
+                            trace_event["tool_name"] = part.function_call.name
+                            if hasattr(part.function_call, "args") and part.function_call.args:
+                                trace_event["tool_args"] = str(part.function_call.args)[:200]
 
-                    # Extract text from response
-                    if hasattr(part, "text") and part.text:
-                        response_text += part.text
-                        if not has_function_call:  # Only show text preview if not a function call
-                            if len(part.text) > 100:
-                                trace_event["content_preview"] = part.text[:100] + "..."
-                            else:
-                                trace_event["content_preview"] = part.text
+                        # Extract text from response
+                        if hasattr(part, "text") and part.text:
+                            response_text += part.text
+                            if not has_function_call:  # Only show text preview if not a function call
+                                if len(part.text) > 100:
+                                    trace_event["content_preview"] = part.text[:100] + "..."
+                                else:
+                                    trace_event["content_preview"] = part.text
 
             # Only add events that have meaningful information
             if ("event_category" in trace_event or

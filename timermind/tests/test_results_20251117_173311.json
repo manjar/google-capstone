@@ -1,0 +1,118 @@
+{
+  "summary": {
+    "total": 1,
+    "passed": 0,
+    "failed": 1,
+    "timestamp": "2025-11-17T17:33:11.891918"
+  },
+  "results": [
+    {
+      "test_id": "test_010_between_two_tasks",
+      "test_name": "Between two tasks - canonical planning scenario",
+      "pass": false,
+      "step_results": [
+        {
+          "step": 1,
+          "action": "send_message",
+          "verification": {
+            "checks": [
+              [
+                "Timer created",
+                true,
+                "\u2713"
+              ],
+              [
+                "Label contains ['mail']",
+                true,
+                "\u2713"
+              ]
+            ],
+            "pass": true
+          },
+          "llm_evaluation": {
+            "pass": true,
+            "reason": "The response correctly created a timer with the specified deadline and included \"mail\" in the timer label, as expected. It also correctly identified that the time has already passed, which is a nice addition even though not explicitly tested.",
+            "details": {
+              "matches": [
+                "creates_timer: true",
+                "timer_label_contains: mail"
+              ],
+              "mismatches": []
+            }
+          }
+        },
+        {
+          "step": 2,
+          "action": "send_message",
+          "verification": {
+            "checks": [
+              [
+                "Timer created",
+                true,
+                "\u2713"
+              ],
+              [
+                "Timer count is 2",
+                true,
+                "\u2713"
+              ]
+            ],
+            "pass": true
+          },
+          "llm_evaluation": {
+            "pass": true,
+            "reason": "The test passed because the AI correctly created a timer for the specified task and time, and the total timer count in the system is now 2. The AI also provided a rationale for the timer's urgency and importance scores.",
+            "details": {
+              "matches": [
+                "creates_timer is true",
+                "timer_count is 2"
+              ],
+              "mismatches": []
+            }
+          }
+        },
+        {
+          "step": 3,
+          "action": "send_message",
+          "verification": {
+            "checks": [
+              [
+                "Timer created",
+                true,
+                "\u2713"
+              ],
+              [
+                "Label contains ['lunch']",
+                false,
+                "\u2717"
+              ],
+              [
+                "Timer count is 3",
+                true,
+                "\u2713"
+              ]
+            ],
+            "pass": false
+          },
+          "llm_evaluation": {
+            "pass": false,
+            "reason": "While the system successfully created a timer for \"Lunch\" and correctly inferred that it should be scheduled between \"getting the mail\" and \"picking up Willem\", it also created timers for \"getting the mail\" and \"picking up Willem\" even though I only asked to create a timer for lunch and gave the other two tasks as constraints for the deadline. Also, the execution trace does not indicate the invocation of the planning and context agents.",
+            "details": {
+              "matches": [
+                "creates_timer",
+                "timer_count",
+                "timer_label_contains"
+              ],
+              "mismatches": [
+                "planning_agent_invoked",
+                "context_agent_invoked",
+                "execution_trace_contains"
+              ]
+            }
+          }
+        }
+      ],
+      "timestamp": "2025-11-17T17:33:11.891714"
+    }
+  ]
+}

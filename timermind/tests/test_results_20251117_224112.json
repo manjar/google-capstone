@@ -1,0 +1,77 @@
+{
+  "summary": {
+    "total": 1,
+    "passed": 1,
+    "failed": 0,
+    "timestamp": "2025-11-17T22:41:12.796811"
+  },
+  "results": [
+    {
+      "test_id": "test_011_preference_importance_recalc",
+      "test_name": "Preference-based importance recalculation",
+      "pass": true,
+      "step_results": [
+        {
+          "step": 1,
+          "action": "send_message",
+          "verification": {
+            "checks": [
+              [
+                "Timer created",
+                true,
+                "\u2713"
+              ],
+              [
+                "Label contains ['movie']",
+                true,
+                "\u2713"
+              ],
+              [
+                "Importance score 0.30 in [0.2, 0.4]",
+                true,
+                "\u2713"
+              ]
+            ],
+            "pass": true
+          },
+          "llm_evaluation": {
+            "pass": true,
+            "reason": "The timer was created as expected, the label contains 'movie', the category is 'personal', and the importance score (0.3) falls within the expected range of 0.2 to 0.4.",
+            "details": {
+              "matches": [
+                "creates_timer",
+                "timer_label_contains",
+                "category",
+                "importance_score_range"
+              ],
+              "mismatches": []
+            }
+          }
+        },
+        {
+          "step": 2,
+          "action": "send_message",
+          "verification": {
+            "checks": [],
+            "pass": true
+          },
+          "llm_evaluation": {
+            "pass": true,
+            "reason": "The response indicates that TimerMind correctly recognized the user's preference for activities with friends, updated the importance score of the 'See movie with friend' timer, and mentioned relevant keywords in its response.",
+            "details": {
+              "matches": [
+                "updates_preferences: true (inferred from the response)",
+                "recalculates_existing_timers: true (timer id 51 was updated)",
+                "response_mentions: 'friend'",
+                "response_mentions: 'important'",
+                "response_mentions: 'updated'"
+              ],
+              "mismatches": []
+            }
+          }
+        }
+      ],
+      "timestamp": "2025-11-17T22:41:12.796545"
+    }
+  ]
+}

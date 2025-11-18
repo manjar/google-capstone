@@ -568,6 +568,7 @@
     <script>
         let currentSessionId = null;
         let thoughtProcessLog = [];
+        let timerRationales = new Map(); // Store rationales by timer ID
 
         // Load initial data
         window.onload = function() {
@@ -730,6 +731,12 @@
                 return;
             }
 
+            // Clear and rebuild rationales map
+            timerRationales.clear();
+            timers.forEach(timer => {
+                timerRationales.set(timer.id, timer.rationale || 'No explanation available');
+            });
+
             // Sort by priority score descending
             timers.sort((a, b) => b.priority_score - a.priority_score);
 
@@ -860,7 +867,7 @@
                         <span class="countdown-deadline">Due: ${deadlineText}</span>
                     </div>
                     <div class="timer-actions">
-                        <button class="btn-icon btn-why" onclick='showRationale(${JSON.stringify(rationale || "No explanation available")})' title="Why is this important?">?</button>
+                        <button class="btn-icon btn-why" onclick="showRationale(${timerId})" title="Why is this important?">?</button>
                         <button class="btn-icon btn-complete" onclick="completeTimer(${timerId})" title="Complete">✓</button>
                         <button class="btn-icon btn-delete" onclick="deleteTimer(${timerId})" title="Delete">✕</button>
                     </div>
@@ -876,7 +883,7 @@
                         <span></span>
                     </div>
                     <div class="timer-actions">
-                        <button class="btn-icon btn-why" onclick='showRationale(${JSON.stringify(rationale || "No explanation available")})' title="Why is this important?">?</button>
+                        <button class="btn-icon btn-why" onclick="showRationale(${timerId})" title="Why is this important?">?</button>
                         <button class="btn-icon btn-complete" onclick="completeTimer(${timerId})" title="Complete">✓</button>
                         <button class="btn-icon btn-delete" onclick="deleteTimer(${timerId})" title="Delete">✕</button>
                     </div>
@@ -911,24 +918,6 @@
             }
 
             let html = '';
-
-            // Category weights
-            if (prefs.category_weights) {
-                html += '<div class="pref-section"><h3>Category Weights</h3>';
-                const sorted = Object.entries(prefs.category_weights)
-                    .sort((a, b) => b[1] - a[1]);
-
-                for (const [category, weight] of sorted) {
-                    const weightClass = weight >= 1.5 ? 'high' : weight <= 0.7 ? 'low' : '';
-                    html += `
-                        <div class="weight-item">
-                            <span>${category}</span>
-                            <span class="weight-value ${weightClass}">${weight.toFixed(1)}</span>
-                        </div>
-                    `;
-                }
-                html += '</div>';
-            }
 
             // Rules
             if (prefs.rules && prefs.rules.length > 0) {
@@ -996,7 +985,8 @@
             }
         }
 
-        function showRationale(rationale) {
+        function showRationale(timerId) {
+            const rationale = timerRationales.get(timerId) || 'No explanation available';
             alert('Why this matters:\n\n' + rationale);
         }
     </script>

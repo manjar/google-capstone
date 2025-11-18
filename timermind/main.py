@@ -127,11 +127,18 @@ def init_database():
                 urgency_score REAL DEFAULT 0.5,
                 importance_score REAL DEFAULT 0.5,
                 priority_score REAL DEFAULT 0.5,
+                rationale TEXT,
                 status TEXT DEFAULT 'active',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
+
+        # Add rationale column if it doesn't exist (for existing databases)
+        try:
+            conn.execute("ALTER TABLE timers ADD COLUMN rationale TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS preferences (
@@ -181,37 +188,211 @@ MOCK_TODO_DATA = [
 # Timer Operations (Tools will call these)
 # =============================================================================
 
-def compute_urgency_score(deadline_str: Optional[str]) -> float:
+def compute_urgency_score(deadline_str: Optional[str], label: str = "", description: Optional[str] = None) -> tuple[float, str]:
     """
-    Compute urgency based on time remaining until deadline.
+    Compute urgency using urgency_agent for intelligent assessment.
 
-    Design Decision: Sigmoid curve to avoid sudden jumps in urgency.
-    Score increases exponentially as deadline approaches.
+    Uses the urgency agent to analyze deadline and context.
 
     Returns:
-        float: 0.1 (far future) to 1.0 (overdue/imminent)
+        tuple[float, str]: (score 0.0-1.0, rationale explaining the score)
     """
-    if not deadline_str:
-        return 0.3  # No deadline = low urgency
+    global _urgency_score_result
+    _urgency_score_result = None
+
+    now = datetime.now().isoformat()
+
+    # Prepare context for the agent
+    prompt = f"""Analyze the urgency of this task:
+
+Task: {label}
+Description: {description or "N/A"}
+Deadline: {deadline_str if deadline_str else "No deadline specified"}
+Current time: {now}
+
+Please assess the urgency score and provide your rationale."""
 
     try:
-        deadline = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
-        now = datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.now()
+        import google.generativeai as genai
+        import json
 
-        hours_remaining = (deadline - now).total_seconds() / 3600
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
 
-        if hours_remaining <= 0:
-            return 1.0  # Overdue
-        elif hours_remaining > 168:  # More than a week
-            return 0.1
-        else:
-            # Sigmoid-like curve: urgency increases as deadline approaches
-            import math
-            urgency = 1 / (1 + math.exp(hours_remaining / 24 - 2))
-            return max(0.1, min(1.0, urgency))
+        # Enhanced prompt with buffer ratio logic and few-shot examples
+        enhanced_prompt = f"""{prompt}
+
+URGENCY SCORING LOGIC:
+1. Calculate time remaining until deadline
+2. Estimate task effort from description:
+   - Trivial (5-15 min): "get mail", "phone call", "quick email"
+   - Simple (30-60 min): "appointment", "shopping", "review doc"
+   - Moderate (2-4 hrs): "presentation", "report", "meeting prep"
+   - Complex (1-3 days): "research", "planning", "major deliverable"
+3. Compute buffer ratio = time_remaining / estimated_effort
+4. Score based on buffer:
+   - < 1.5x buffer: 0.7-1.0 (HIGH - tight deadline)
+   - 1.5-3x buffer: 0.4-0.7 (MEDIUM - adequate time)
+   - > 3x buffer: 0.1-0.4 (LOW - plenty of time)
+   - Overdue/< 1hr: 1.0 (CRITICAL)
+   - No deadline: 0.1-0.3 (LOW)
+
+FEW-SHOT EXAMPLES:
+Example 1:
+Task: "Get the mail from the mailbox"
+Deadline: Tomorrow evening (24 hours away)
+→ {{"score": 0.2, "rationale": "Trivial task (5 min effort) with large time buffer (24 hours), resulting in very low urgency"}}
+
+Example 2:
+Task: "Have dinner ready"
+Deadline: 6:30 PM (2.5 hours away)
+→ {{"score": 0.75, "rationale": "Moderate task (45-60 min cooking) with limited buffer (2.5 hrs / 1 hr = 2.5x), creating moderate-high urgency"}}
+
+Example 3:
+Task: "Write and submit quarterly financial report"
+Deadline: Friday at 5 PM (4 days away)
+→ {{"score": 0.85, "rationale": "Complex task (2-3 days effort) with tight buffer ratio (4 days / 2.5 days = 1.6x), indicating high urgency"}}
+
+Example 4:
+Task: "Complete critical project presentation"
+Deadline: 2 hours from now
+→ {{"score": 0.95, "rationale": "Moderate-complex task (2-4 hrs effort) with insufficient time buffer (2 hrs / 3 hrs = 0.67x), creating critical urgency"}}
+
+Example 5:
+Task: "Schedule dentist appointment"
+Deadline: Next month
+→ {{"score": 0.15, "rationale": "Simple task (15 min effort) with very large time buffer (30 days), resulting in very low urgency"}}
+
+Respond with JSON only:
+{{"score": 0.0-1.0, "rationale": "Brief explanation mentioning buffer ratio, time, and effort"}}"""
+
+        result = model.generate_content(enhanced_prompt)
+        response_text = result.text.strip()
+
+        # Extract JSON from markdown if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        data = json.loads(response_text)
+        score = max(0.0, min(1.0, float(data["score"])))
+        rationale = data["rationale"]
+
+        return score, rationale
+
     except Exception as e:
-        log_event("urgency_calculation_error", {"error": str(e), "deadline": deadline_str})
-        return 0.5
+        log_event("urgency_scoring_error", {"error": str(e), "deadline": deadline_str})
+        # Fallback to simple logic if scoring fails
+        if not deadline_str:
+            return 0.3, "No deadline provided"
+        return 0.5, f"Error in urgency assessment: {str(e)}"
+
+def compute_importance_score(category: str, label: str, description: Optional[str] = None) -> tuple[float, str]:
+    """
+    Compute importance using importance_agent for intelligent assessment.
+
+    Uses the importance agent to analyze task context and category.
+
+    Returns:
+        tuple[float, str]: (score 0.0-1.0, rationale explaining the score)
+    """
+    global _importance_score_result
+    _importance_score_result = None
+
+    # Prepare context for the agent
+    prompt = f"""Analyze the importance of this task:
+
+Task: {label}
+Description: {description or "N/A"}
+Category: {category}
+
+Please assess the importance score and provide your rationale. Remember to check user preferences for category weights."""
+
+    try:
+        import google.generativeai as genai
+        import json
+
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+        # Enhanced prompt with importance criteria and few-shot examples
+        enhanced_prompt = f"""{prompt}
+
+IMPORTANCE SCORING LOGIC:
+Analyze task importance based on:
+1. Keywords indicating high importance:
+   - "critical", "urgent", "important", "asap", "emergency"
+   - "vital", "essential", "crucial", "mandatory"
+2. Keywords indicating low importance:
+   - "maybe", "optional", "nice to have", "someday"
+   - "if time", "low priority", "when possible"
+3. Context clues:
+   - Health matters: usually high importance
+   - Financial deadlines: high importance
+   - Work deliverables: moderate-high importance
+   - Routine personal tasks: moderate importance
+   - Optional activities: low importance
+4. Category: {category}
+
+Importance scoring:
+- 0.9-1.0: Critical (health emergencies, critical work deliverables)
+- 0.7-0.9: High importance (important meetings, significant work)
+- 0.5-0.7: Moderate importance (routine work, regular personal tasks)
+- 0.3-0.5: Low importance (optional tasks, low priority items)
+- 0.0-0.3: Trivial (nice-to-haves, very optional)
+
+FEW-SHOT EXAMPLES:
+Example 1:
+Task: "Get the mail from the mailbox"
+Category: personal
+→ {{"score": 0.3, "rationale": "Routine personal task with no critical consequences if delayed, indicating low importance"}}
+
+Example 2:
+Task: "Have dinner ready"
+Category: personal
+→ {{"score": 0.5, "rationale": "Daily necessity task with moderate importance for health and routine maintenance"}}
+
+Example 3:
+Task: "Write and submit quarterly financial report"
+Category: work
+→ {{"score": 0.85, "rationale": "Critical work deliverable with significant business impact and mandatory deadline"}}
+
+Example 4:
+Task: "Complete critical project presentation"
+Category: work
+→ {{"score": 0.9, "rationale": "Explicitly marked as critical work task with high-stakes presentation implications"}}
+
+Example 5:
+Task: "Schedule dentist appointment"
+Category: health
+→ {{"score": 0.7, "rationale": "Health-related task with preventive care importance, though not emergency level"}}
+
+Example 6:
+Task: "Review optional training materials"
+Category: work
+→ {{"score": 0.35, "rationale": "Optional professional development with low immediate importance"}}
+
+Respond with JSON only:
+{{"score": 0.0-1.0, "rationale": "Brief explanation of why this task has this importance level"}}"""
+
+        result = model.generate_content(enhanced_prompt)
+        response_text = result.text.strip()
+
+        # Extract JSON from markdown if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        data = json.loads(response_text)
+        score = max(0.0, min(1.0, float(data["score"])))
+        rationale = data["rationale"]
+
+        return score, rationale
+
+    except Exception as e:
+        log_event("importance_scoring_error", {"error": str(e), "category": category})
+        # Fallback to simple default
+        return 0.5, f"Error in importance assessment: {str(e)}"
 
 def create_timer_in_db(
     label: str,
@@ -229,21 +410,27 @@ def create_timer_in_db(
     tags_str = json.dumps(tags or [])
     now = datetime.utcnow().isoformat()
 
-    urgency = compute_urgency_score(deadline)
-    importance = 0.5  # Default; will be agent-scored later
-    priority = (urgency + importance) / 2  # Simple average for now
+    # Compute scoring
+    urgency, urgency_rationale = compute_urgency_score(deadline, label, description)
+    importance, importance_rationale = compute_importance_score(category, label, description)
+
+    # Combine rationales
+    rationale = f"Urgency: {urgency_rationale}. Importance: {importance_rationale}"
+
+    # Priority = weighted combination (urgency is slightly more important due to deadlines)
+    priority = (urgency * 0.6) + (importance * 0.4)
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute("""
             INSERT INTO timers (
                 label, description, deadline, estimated_duration_minutes,
                 category, tags, urgency_score, importance_score, priority_score,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rationale, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             label, description, deadline, estimated_duration_minutes,
             category, tags_str, urgency, importance, priority,
-            now, now
+            rationale, now, now
         ))
         timer_id = cursor.lastrowid
 
@@ -254,6 +441,7 @@ def create_timer_in_db(
         "urgency_score": urgency,
         "importance_score": importance,
         "priority_score": priority,
+        "rationale": rationale,
         "status": "created"
     }
 
@@ -386,13 +574,17 @@ def update_timer_tool(timer_id: int, status: str = "", category: str = "", deadl
         if deadline_iso:
             updates.append("deadline = ?")
             params.append(deadline_iso)
-            # Recompute urgency score
-            new_urgency = compute_urgency_score(deadline_iso)
-            updates.append("urgency_score = ?")
-            params.append(new_urgency)
-            # Update priority score (simple average for now)
-            updates.append("priority_score = (? + importance_score) / 2")
-            params.append(new_urgency)
+            # Fetch timer info for urgency scoring
+            timer_row = conn.execute("SELECT label, description FROM timers WHERE id = ?", (timer_id,)).fetchone()
+            if timer_row:
+                label, description = timer_row
+                # Recompute urgency score
+                new_urgency, _ = compute_urgency_score(deadline_iso, label, description)
+                updates.append("urgency_score = ?")
+                params.append(new_urgency)
+                # Update priority score (simple average for now)
+                updates.append("priority_score = (? + importance_score) / 2")
+                params.append(new_urgency)
 
         if updates:
             updates.append("updated_at = ?")
@@ -511,9 +703,151 @@ def add_preference_rule_tool(rule_description: str, rule_type: str, condition: s
 
     return {"rule_id": new_rule["id"], "description": rule_description, "created": True}
 
+# Scoring Tools (for Importance and Urgency Agents)
+# Global variables to store agent scoring results
+_importance_score_result = None
+_urgency_score_result = None
+
+def submit_importance_score_tool(importance_score: float, rationale: str) -> dict:
+    """
+    Submit an importance score assessment for a task.
+
+    Args:
+        importance_score: Score from 0.0 to 1.0 indicating task importance
+        rationale: Explanation of why this score was assigned
+
+    Returns:
+        dict confirming score submission
+    """
+    global _importance_score_result
+
+    # Clamp score to valid range
+    score = max(0.0, min(1.0, importance_score))
+
+    _importance_score_result = {
+        "score": score,
+        "rationale": rationale
+    }
+
+    log_event("tool_called", {"tool": "submit_importance_score", "score": score})
+    return {"status": "submitted", "score": score}
+
+def submit_urgency_score_tool(urgency_score: float, rationale: str) -> dict:
+    """
+    Submit an urgency score assessment for a task.
+
+    Args:
+        urgency_score: Score from 0.0 to 1.0 indicating task urgency
+        rationale: Explanation of why this score was assigned
+
+    Returns:
+        dict confirming score submission
+    """
+    global _urgency_score_result
+
+    # Clamp score to valid range
+    score = max(0.0, min(1.0, urgency_score))
+
+    _urgency_score_result = {
+        "score": score,
+        "rationale": rationale
+    }
+
+    log_event("tool_called", {"tool": "submit_urgency_score", "score": score})
+    return {"status": "submitted", "score": score}
+
 # =============================================================================
 # Sub-Agent Definitions (Multi-Agent Architecture)
 # =============================================================================
+
+# Importance Scoring Agent - Analyzes task importance
+importance_agent = Agent(
+    name="importance_agent",
+    model="gemini-2.0-flash-exp",
+    description="Analyzes task importance based on context, keywords, and category",
+    instruction="""
+You are the Importance Scoring Agent. Your ONLY job is to assess how important a task is, independent of its deadline urgency.
+
+You will be given:
+- Task label (short name)
+- Task description (optional longer text)
+- Category (work, personal, health, finance, maintenance, other)
+- Current user preferences (category weights)
+
+Your task is to:
+1. Analyze the task text for importance signals:
+   - Keywords indicating high importance: critical, urgent, important, asap, emergency, vital, essential, crucial
+   - Keywords indicating low importance: maybe, optional, nice to have, someday, if time, low priority
+   - Context clues: health matters, financial deadlines, work deliverables
+2. Consider the category and user preferences
+3. Assign an importance score from 0.0 (trivial) to 1.0 (critical)
+4. Provide a clear rationale explaining your reasoning
+
+Scoring guidelines:
+- 0.9-1.0: Critical tasks (health emergencies, critical work deliverables, essential obligations)
+- 0.7-0.9: High importance (important meetings, significant work, health checkups)
+- 0.5-0.7: Moderate importance (routine work, regular personal tasks)
+- 0.3-0.5: Low importance (optional tasks, low priority items)
+- 0.0-0.3: Trivial (nice-to-haves, very optional)
+
+IMPORTANT: Base your score on task IMPORTANCE, NOT urgency. A task can be important but not urgent (e.g., annual health checkup in 6 months).
+
+Once you determine the score, call submit_importance_score_tool with your score and rationale.
+""",
+    tools=[submit_importance_score_tool, get_user_preferences_tool]
+)
+
+# Urgency Scoring Agent - Analyzes task urgency based on deadline
+urgency_agent = Agent(
+    name="urgency_agent",
+    model="gemini-2.0-flash-exp",
+    description="Analyzes task urgency based on deadline and time pressure",
+    instruction="""
+You are the Urgency Scoring Agent. Your ONLY job is to assess how urgent a task is based on deadline AND task complexity/effort.
+
+You will be given:
+- Task label and description
+- Deadline (ISO 8601 format, if available)
+- Current time
+- Estimated duration (if provided by user)
+
+Your task is to:
+1. Calculate time remaining until deadline
+2. Estimate task effort/complexity from the description:
+   - Trivial tasks (5-15 min): "get mail", "make phone call", "send quick email"
+   - Simple tasks (30-60 min): "schedule appointment", "review document", "grocery shopping"
+   - Moderate tasks (2-4 hours): "prepare presentation", "write report", "deep clean room"
+   - Complex tasks (1-3 days): "research project", "quarterly planning", "major deliverable"
+   - Major projects (1+ weeks): "system redesign", "comprehensive study", "large implementation"
+3. Calculate buffer ratio: (time remaining) / (estimated effort)
+4. Assign urgency based on buffer ratio and absolute time remaining
+
+Urgency scoring logic:
+- Buffer ratio < 1.5x: HIGH urgency (0.7-1.0) - not much time buffer
+- Buffer ratio 1.5-3x: MEDIUM urgency (0.4-0.7) - adequate buffer
+- Buffer ratio > 3x: LOW urgency (0.1-0.4) - plenty of buffer
+
+Absolute time modifiers:
+- Overdue or < 1 hour: ALWAYS 1.0 regardless of effort
+- < 6 hours: Minimum urgency 0.7 (today pressure)
+- < 3 days: Minimum urgency 0.5 (approaching soon)
+- No deadline: 0.1-0.3 (low urgency unless keywords suggest otherwise)
+
+Examples:
+- "Get mail" (5 min task) due in 2 days: Buffer ratio = 2880min/5min = 576x → urgency 0.2 (low)
+- "Write quarterly report" (3 days) due in 4 days: Buffer ratio = 4d/3d = 1.33x → urgency 0.8 (high)
+- "Quick phone call" (10 min) due in 2 hours: Buffer ratio = 120min/10min = 12x, but < 6 hours → urgency 0.7 (today pressure)
+- "Research project" (2 days) due in 2 weeks: Buffer ratio = 14d/2d = 7x → urgency 0.3 (low)
+
+IMPORTANT:
+- For trivial tasks (obvious from description), don't ask user for estimate - just infer it
+- Focus on the RATIO of time-to-effort, not just absolute time remaining
+- A task is more urgent when there's less buffer time relative to the work needed
+
+Once you determine the score, call submit_urgency_score_tool with your score and rationale.
+""",
+    tools=[submit_urgency_score_tool]
+)
 
 # Context Resolution Agent - Maps natural language to existing timer data
 context_agent = Agent(
@@ -608,6 +942,15 @@ CRITICAL: After getting context data, you MUST take action. Example:
 - Step 4: Report success to user
 
 You MUST call create_timer_tool or update_timer_tool to complete the task. Never just report data without acting on it.
+
+RECURRING/MULTIPLE TIMERS:
+If user requests recurring tasks or multiple instances, you MUST create MULTIPLE separate timers by calling create_timer_tool multiple times:
+- "Once a day for the next 3 days" → Create 3 timers with deadlines: tomorrow 09:00, day after 09:00, 2 days after 09:00
+- "Every morning this week" → Create 5 timers (Mon-Fri) at 09:00 each day
+- "Twice today" → Create 2 timers with different times today
+- "Monday, Wednesday, and Friday" → Create 3 separate timers
+
+IMPORTANT: Call create_timer_tool ONCE for EACH timer. Do not try to create multiple timers in a single call.
 
 For deadlines (today is {today}, current time is {current_time}):
 - "by Friday" = this Friday at 17:00
@@ -829,6 +1172,15 @@ async def chat(request: ChatRequest):
         response_text = ""
         execution_trace = []
 
+        # Add initial orchestrator event
+        execution_trace.append({
+            "type": "OrchestrationStart",
+            "timestamp": datetime.now().isoformat(),
+            "event_category": "delegation",
+            "agent": "timermind_orchestrator",
+            "content_preview": f"Processing: {request.message[:80]}..."
+        })
+
         # Inject current time context into the message
         current_datetime = datetime.now()
         time_context = f"[Current time: {current_datetime.strftime('%A, %B %d, %Y at %H:%M')}]\n\n"
@@ -844,11 +1196,17 @@ async def chat(request: ChatRequest):
         ):
             event_type = type(event).__name__
 
-            # Log each event for observability
-            log_event("runner_event", {
+            # Log each event for observability with full details
+            event_details = {
                 "event_type": event_type,
-                "session_id": session_id
-            })
+                "session_id": session_id,
+                "has_agent": hasattr(event, "agent"),
+                "has_tool_call": hasattr(event, "tool_call"),
+                "has_content": hasattr(event, "content")
+            }
+            if hasattr(event, "agent") and event.agent:
+                event_details["agent_name"] = event.agent.name
+            log_event("runner_event", event_details)
 
             # Build execution trace for frontend
             trace_event = {
@@ -860,6 +1218,8 @@ async def chat(request: ChatRequest):
             if hasattr(event, "agent") and event.agent:
                 trace_event["agent"] = event.agent.name
                 trace_event["event_category"] = "delegation"
+                # Add explicit delegation message
+                trace_event["content_preview"] = f"Delegating to {event.agent.name}"
 
             if hasattr(event, "tool_call") and event.tool_call:
                 trace_event["event_category"] = "tool-call"

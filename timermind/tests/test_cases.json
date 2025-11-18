@@ -1,0 +1,205 @@
+[
+  {
+    "id": "test_001_dinner_by_630",
+    "name": "Dinner deadline with effort estimation",
+    "description": "Tests urgency scoring with buffer ratio logic for a cooking task",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "I need to have dinner ready by 6:30",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_label_contains": "dinner",
+          "has_deadline": true,
+          "deadline_hour": 18,
+          "deadline_minute": 30,
+          "urgency_score_range": [0.5, 1.0],
+          "importance_score_range": [0.3, 0.7],
+          "has_rationale": true,
+          "rationale_not_empty": true
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    }
+  },
+  {
+    "id": "test_002_trivial_task_low_urgency",
+    "name": "Trivial task with long deadline",
+    "description": "Tests that trivial tasks with ample time get low urgency scores",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "Get the mail from the mailbox by tomorrow evening",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_label_contains": "mail",
+          "has_deadline": true,
+          "urgency_score_range": [0.1, 0.5]
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    }
+  },
+  {
+    "id": "test_003_complex_task_tight_deadline",
+    "name": "Complex task with insufficient time buffer",
+    "description": "Tests high urgency scoring when task effort exceeds time available",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "Write and submit the quarterly financial report by Friday at 5 PM",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_label_contains": ["report", "quarterly"],
+          "has_deadline": true,
+          "urgency_score_range": [0.7, 1.0],
+          "importance_score_range": [0.7, 1.0]
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    }
+  },
+  {
+    "id": "test_004_multi_timer_prioritization",
+    "name": "Multiple timers with different priorities",
+    "description": "Tests that priority scoring correctly ranks multiple tasks",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "Get the mail by tomorrow",
+        "expected_behavior": {
+          "creates_timer": true
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Complete the critical project presentation in 2 hours",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_count": 2
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Schedule a dentist appointment for next month",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_count": 3
+        }
+      },
+      {
+        "action": "verify_ordering",
+        "expected_behavior": {
+          "first_timer_contains": "presentation",
+          "last_timer_contains": "dentist"
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    }
+  },
+  {
+    "id": "test_005_preference_learning",
+    "name": "Category preference learning",
+    "description": "Tests that preference agent learns and stores user priorities",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "Health is more important to me than work",
+        "expected_behavior": {
+          "updates_preferences": true,
+          "preference_category": "health",
+          "preference_weight_gt": 1.0
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Add dentist appointment for next week",
+        "expected_behavior": {
+          "creates_timer": true,
+          "category": "health",
+          "importance_score_range": [0.6, 1.0]
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    }
+  },
+  {
+    "id": "test_006_context_resolution",
+    "name": "Fuzzy reference to existing timer",
+    "description": "Tests context agent's ability to resolve ambiguous task references",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "Submit the report by Friday",
+        "expected_behavior": {
+          "creates_timer": true
+        }
+      },
+      {
+        "action": "send_message",
+        "message": "Actually, make it Thursday instead",
+        "expected_behavior": {
+          "updates_timer": true,
+          "timer_count": 1,
+          "deadline_day": "Thursday"
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    }
+  },
+  {
+    "id": "test_007_rationale_formatting",
+    "name": "Rationale string formatting (Why button regression)",
+    "description": "Regression test for JavaScript bug in Why button - ensures rationales are valid strings that won't break onclick handlers",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "I need to have dinner ready by 6:30",
+        "expected_behavior": {
+          "creates_timer": true,
+          "has_rationale": true,
+          "rationale_is_string": true,
+          "rationale_not_empty": true
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    },
+    "regression_for": "JavaScript error: Can't find variable: timer in dashboard.html onclick handler",
+    "fixed_in_commit": "TBD"
+  },
+  {
+    "id": "test_008_recurring_multiple_timers",
+    "name": "Recurring task creates multiple timers",
+    "description": "Tests that recurring task requests (e.g., 'once a day for the next three days') create multiple separate timers",
+    "steps": [
+      {
+        "action": "send_message",
+        "message": "Once a day for the next three days I need to check the weather in the morning",
+        "expected_behavior": {
+          "creates_timer": true,
+          "timer_count": 3,
+          "all_timers_have_label_contains": "weather"
+        }
+      }
+    ],
+    "cleanup": {
+      "reset_data": true
+    },
+    "regression_for": "Recurring tasks only create one timer instead of multiple instances",
+    "fixed_in_commit": "TBD"
+  }
+]

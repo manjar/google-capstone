@@ -111,14 +111,16 @@
             font-family: monospace;
             font-size: 0.85em;
             white-space: pre-wrap;
+            line-height: 1.1;
         }
 
         .thought-item {
-            margin-bottom: 8px;
-            padding: 6px;
+            margin: 0;
+            padding: 1px 2px;
             background: #fff;
-            border-left: 3px solid #17a2b8;
+            border-left: 2px solid #17a2b8;
             font-size: 0.85em;
+            line-height: 1.1;
         }
 
         .thought-item.tool-call {
@@ -131,12 +133,14 @@
 
         .thought-item .timestamp {
             color: #888;
-            font-size: 0.8em;
+            font-size: 0.75em;
+            margin-right: 4px;
         }
 
         .thought-item .event-type {
             font-weight: 600;
             color: #495057;
+            margin-right: 4px;
         }
 
         .message {
@@ -372,7 +376,7 @@
         .countdown-container {
             margin-top: 10px;
             position: relative;
-            margin-right: 80px;
+            margin-right: 110px;
         }
 
         .btn-icon {
@@ -396,6 +400,11 @@
 
         .btn-delete {
             background: #dc3545;
+            color: white;
+        }
+
+        .btn-why {
+            background: #17a2b8;
             color: white;
         }
 
@@ -595,11 +604,7 @@
                            type === 'delegation' ? 'Delegation' :
                            type === 'response' ? 'Response' : 'Event';
 
-            thoughtItem.innerHTML = `
-                <div class="timestamp">${timestamp}</div>
-                <div class="event-type">${typeLabel}</div>
-                <div>${content}</div>
-            `;
+            thoughtItem.innerHTML = `<span class="timestamp">${timestamp}</span> <span class="event-type">${typeLabel}</span> ${content}`;
 
             thoughtDiv.appendChild(thoughtItem);
             thoughtDiv.scrollTop = thoughtDiv.scrollHeight;
@@ -741,7 +746,7 @@
                         minute: '2-digit'
                     }) : 'No deadline';
 
-                const countdownHtml = timer.deadline ? createCountdownBar(timer.deadline, timer.id) : createNoDeadlineBar(timer.id);
+                const countdownHtml = timer.deadline ? createCountdownBar(timer.deadline, timer.id, timer.rationale) : createNoDeadlineBar(timer.id, timer.rationale);
 
                 return `
                     <div class="timer-item ${urgencyClass}">
@@ -763,7 +768,7 @@
         // Logarithmic countdown bar - non-linear scale
         // Scale: |---minutes---|--hours--|--days--|months|yr|
         // Total range: 0 (now) to 1 year
-        function createCountdownBar(deadlineStr, timerId) {
+        function createCountdownBar(deadlineStr, timerId, rationale) {
             const deadline = new Date(deadlineStr);
             const now = new Date();
             const msRemaining = deadline - now;
@@ -855,6 +860,7 @@
                         <span class="countdown-deadline">Due: ${deadlineText}</span>
                     </div>
                     <div class="timer-actions">
+                        <button class="btn-icon btn-why" onclick='showRationale(${JSON.stringify(rationale || "No explanation available")})' title="Why is this important?">?</button>
                         <button class="btn-icon btn-complete" onclick="completeTimer(${timerId})" title="Complete">✓</button>
                         <button class="btn-icon btn-delete" onclick="deleteTimer(${timerId})" title="Delete">✕</button>
                     </div>
@@ -862,7 +868,7 @@
             `;
         }
 
-        function createNoDeadlineBar(timerId) {
+        function createNoDeadlineBar(timerId, rationale) {
             return `
                 <div class="countdown-container">
                     <div class="countdown-info">
@@ -870,6 +876,7 @@
                         <span></span>
                     </div>
                     <div class="timer-actions">
+                        <button class="btn-icon btn-why" onclick='showRationale(${JSON.stringify(rationale || "No explanation available")})' title="Why is this important?">?</button>
                         <button class="btn-icon btn-complete" onclick="completeTimer(${timerId})" title="Complete">✓</button>
                         <button class="btn-icon btn-delete" onclick="deleteTimer(${timerId})" title="Delete">✕</button>
                     </div>
@@ -987,6 +994,10 @@
             } catch (error) {
                 alert('Error deleting timer: ' + error.message);
             }
+        }
+
+        function showRationale(rationale) {
+            alert('Why this matters:\n\n' + rationale);
         }
     </script>
 </body>

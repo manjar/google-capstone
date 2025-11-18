@@ -1,0 +1,74 @@
+{
+  "summary": {
+    "total": 1,
+    "passed": 0,
+    "failed": 1,
+    "timestamp": "2025-11-17T15:42:49.686481"
+  },
+  "results": [
+    {
+      "test_id": "test_001_dinner_by_630",
+      "test_name": "Dinner deadline with effort estimation",
+      "pass": false,
+      "step_results": [
+        {
+          "step": 1,
+          "action": "send_message",
+          "verification": {
+            "checks": [
+              [
+                "Timer created",
+                true,
+                "\u2713"
+              ],
+              [
+                "Label contains ['dinner']",
+                true,
+                "\u2713"
+              ],
+              [
+                "Has deadline",
+                true,
+                "\u2713"
+              ],
+              [
+                "Urgency score 0.50 in [0.5, 1.0]",
+                true,
+                "\u2713"
+              ],
+              [
+                "Importance score 0.50 in [0.3, 0.7]",
+                true,
+                "\u2713"
+              ],
+              [
+                "Rationale mentions 'buffer'",
+                false,
+                "\u2717"
+              ],
+              [
+                "Rationale mentions 'time'",
+                false,
+                "\u2717"
+              ],
+              [
+                "Rationale mentions 'effort'",
+                false,
+                "\u2717"
+              ]
+            ],
+            "pass": false
+          },
+          "llm_evaluation": {
+            "pass": null,
+            "reason": "LLM evaluation failed: Expecting ',' delimiter: line 6 column 22 (char 419)",
+            "details": {
+              "error": "Expecting ',' delimiter: line 6 column 22 (char 419)"
+            }
+          }
+        }
+      ],
+      "timestamp": "2025-11-17T15:42:49.686215"
+    }
+  ]
+}

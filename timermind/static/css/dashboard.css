@@ -1,0 +1,499 @@
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: #f5f5f5;
+    color: #333;
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    height: calc(100vh - 40px);
+}
+
+.panel {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+}
+
+.panel h2 {
+    margin-bottom: 15px;
+    color: #2c3e50;
+    font-size: 1.2em;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.left-column {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+/* Chat Panel */
+.chat-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+.tab-container {
+    display: flex;
+    border-bottom: 2px solid #ddd;
+    margin-bottom: 10px;
+}
+
+.tab {
+    padding: 8px 16px;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    font-size: 0.9em;
+    color: #666;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+}
+
+.tab.active {
+    color: #007bff;
+    border-bottom-color: #007bff;
+    font-weight: 500;
+}
+
+.tab:hover {
+    color: #0056b3;
+}
+
+.tab-content {
+    display: none;
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 10px;
+    background: #fafafa;
+    max-height: 400px;
+    min-height: 200px;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+}
+
+.thought-process {
+    font-family: monospace;
+    font-size: 0.85em;
+    white-space: pre-wrap;
+    line-height: 1.1;
+}
+
+.thought-item {
+    margin: 0;
+    padding: 1px 2px;
+    background: #fff;
+    border-left: 2px solid #17a2b8;
+    font-size: 0.85em;
+    line-height: 1.1;
+}
+
+.thought-item.tool-call {
+    border-left-color: #28a745;
+}
+
+.thought-item.delegation {
+    border-left-color: #ffc107;
+}
+
+.thought-item.memory {
+    border-left-color: #4CAF50;
+    background: #f0f8ff;
+}
+
+.thought-item .timestamp {
+    color: #888;
+    font-size: 0.75em;
+    margin-right: 4px;
+}
+
+.thought-item .event-type {
+    font-weight: 600;
+    color: #495057;
+    margin-right: 4px;
+}
+
+.message {
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    max-width: 85%;
+}
+
+.message.user {
+    background: #007bff;
+    color: white;
+    margin-left: auto;
+}
+
+.message.assistant {
+    background: #e9ecef;
+    color: #333;
+}
+
+.chat-input {
+    display: flex;
+    gap: 10px;
+}
+
+.chat-input input {
+    flex: 1;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+.chat-input button {
+    padding: 10px 20px;
+    background: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+}
+
+.chat-input button:hover {
+    background: #0056b3;
+}
+
+.chat-input button:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+
+/* Timers Panel */
+.timers-list {
+    flex: 1;
+    overflow-y: auto;
+}
+
+.timer-item {
+    background: #f8f9fa;
+    border-left: 4px solid #6c757d;
+    padding: 12px;
+    margin-bottom: 10px;
+    border-radius: 4px;
+}
+
+.timer-item.high-urgency {
+    border-left-color: #dc3545;
+}
+
+.timer-item.medium-urgency {
+    border-left-color: #ffc107;
+}
+
+.timer-item.low-urgency {
+    border-left-color: #28a745;
+}
+
+.timer-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 5px;
+}
+
+.timer-label {
+    font-weight: 600;
+    font-size: 1.1em;
+}
+
+.timer-category {
+    font-size: 0.8em;
+    color: #666;
+    background: #e9ecef;
+    padding: 2px 8px;
+    border-radius: 3px;
+}
+
+.timer-meta {
+    font-size: 0.85em;
+    color: #666;
+}
+
+.timer-scores {
+    display: flex;
+    gap: 15px;
+    margin-top: 8px;
+    font-size: 0.85em;
+}
+
+.score {
+    background: #e9ecef;
+    padding: 2px 8px;
+    border-radius: 3px;
+}
+
+.score.priority {
+    background: #007bff;
+    color: white;
+}
+
+/* Countdown Timer Bar */
+.countdown-container {
+    margin-top: 10px;
+    position: relative;
+}
+
+.countdown-bar {
+    height: 20px;
+    background: #e9ecef;
+    border-radius: 3px;
+    position: relative;
+    overflow: hidden;
+}
+
+.countdown-fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    height: 100%;
+    border-radius: 3px;
+    transition: width 1s linear;
+    overflow: hidden;
+}
+
+.countdown-fill::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: var(--inner-width, 100%);
+    height: 100%;
+    background: linear-gradient(90deg, #dc3545 0%, #ffc107 30%, #28a745 100%);
+    border-radius: 3px;
+}
+
+.countdown-bar {
+    background: #e9ecef;
+    position: relative;
+}
+
+.countdown-bar::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, #dc3545 0%, #ffc107 30%, #28a745 100%);
+    border-radius: 3px;
+    opacity: 0.15;
+    pointer-events: none;
+}
+
+.countdown-scale {
+    position: relative;
+    height: 25px;
+    font-size: 0.7em;
+    color: #666;
+    margin-bottom: 5px;
+}
+
+.tick-mark {
+    position: absolute;
+    top: 0;
+    transform: translateX(-50%);
+    text-align: center;
+}
+
+.tick-mark::before {
+    content: '|';
+    display: block;
+    color: #999;
+}
+
+.countdown-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.85em;
+    color: #666;
+    margin-top: 0;
+}
+
+.countdown-time-left {
+    font-weight: 500;
+}
+
+.countdown-time-left.urgent {
+    color: #dc3545;
+    font-weight: 600;
+}
+
+.countdown-time-left.overdue {
+    color: #dc3545;
+    font-weight: 700;
+}
+
+.countdown-deadline {
+    color: #888;
+}
+
+/* Timer Actions */
+.timer-actions {
+    display: flex;
+    gap: 6px;
+    position: absolute;
+    right: -70px;
+    top: 10px;
+    transform: translateY(-50%);
+}
+
+.countdown-container {
+    margin-top: 10px;
+    position: relative;
+    margin-right: 110px;
+}
+
+.btn-icon {
+    padding: 4px 8px;
+    font-size: 0.9em;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.2s;
+}
+
+.btn-icon:hover {
+    opacity: 1;
+}
+
+.btn-complete {
+    background: #28a745;
+    color: white;
+}
+
+.btn-delete {
+    background: #dc3545;
+    color: white;
+}
+
+.btn-why {
+    background: #17a2b8;
+    color: white;
+}
+
+/* Preferences Panel */
+.preferences-content {
+    font-size: 0.9em;
+}
+
+.pref-section {
+    margin-bottom: 15px;
+}
+
+.pref-section h3 {
+    font-size: 1em;
+    color: #495057;
+    margin-bottom: 8px;
+}
+
+.weight-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid #eee;
+}
+
+.weight-value {
+    font-weight: 500;
+}
+
+.weight-value.high {
+    color: #28a745;
+}
+
+.weight-value.low {
+    color: #dc3545;
+}
+
+/* Controls */
+.controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.btn {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85em;
+}
+
+.btn-danger {
+    background: #dc3545;
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #c82333;
+}
+
+.btn-secondary {
+    background: #6c757d;
+    color: white;
+}
+
+.btn-secondary:hover {
+    background: #5a6268;
+}
+
+.status {
+    font-size: 0.8em;
+    color: #666;
+    margin-top: 5px;
+}
+
+.session-info {
+    font-size: 0.75em;
+    color: #888;
+    margin-top: 10px;
+}
+
+.empty-state {
+    color: #999;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+}
+
+@media (max-width: 1024px) {
+    .container {
+        grid-template-columns: 1fr;
+    }
+}

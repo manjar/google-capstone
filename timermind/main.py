@@ -385,11 +385,13 @@ def detect_timeline_conflicts(
                             })
 
         # Check 3: After existing event, check if there's time to get to new event
-        if existing_time < new_time and new_destination and existing_destination and new_departure_dt:
+        # LOCATION CHAINING: Calculate direct travel from existing location to new location
+        if existing_time < new_time and new_destination and existing_destination:
             # Existing event is before new event
             # Calculate actual travel time from existing destination to new destination
+            # This implements proper location state tracking - you're AT the existing location after it ends
             # Use end time if existing event has duration
-            time_available_minutes = (new_departure_dt - existing_end_time).total_seconds() / 60
+            time_available_minutes = (new_time - existing_end_time).total_seconds() / 60
 
             # Only check if events are within reasonable time of each other
             if time_available_minutes > 0 and time_available_minutes < 720:  # Within 12 hours
@@ -410,7 +412,7 @@ def detect_timeline_conflicts(
                             existing_duration_msg = f" ({existing_duration} min duration, ends {existing_end_time.strftime('%I:%M %p')})" if existing_duration else f" (ends {existing_end_time.strftime('%I:%M %p')})"
                             conflicts.append({
                                 'type': 'insufficient_travel_time',
-                                'description': f"After '{existing_label}' at {existing_destination}{existing_duration_msg}, you need to be at '{new_label}' in {new_destination} by {new_departure_dt.strftime('%I:%M %p')}. Travel time is {int(actual_travel_minutes)} minutes, but you only have {int(time_available_minutes)} minutes available (short by {int(shortfall)} minutes)",
+                                'description': f"After '{existing_label}' at {existing_destination}{existing_duration_msg}, you need to be at '{new_label}' in {new_destination} by {new_time.strftime('%I:%M %p')}. Travel time is {int(actual_travel_minutes)} minutes, but you only have {int(time_available_minutes)} minutes available (short by {int(shortfall)} minutes)",
                                 'conflicting_timer': existing_timer,
                                 'severity': 'critical' if shortfall > 5 else 'warning',
                                 'actual_travel_time': int(actual_travel_minutes),
@@ -992,6 +994,26 @@ def create_timer_tool(
     Returns:
         dict with timer_id, computed scores, and creation status
     """
+    # CRITICAL VALIDATION: Prevent timers with no deadline
+    # User's directive: "Timer with no deadline is a concept we should go to great lengths to avoid"
+    if not deadline_iso or deadline_iso.strip() == "":
+        error_msg = (
+            "ERROR: Cannot create timer without a deadline. Every task must have a specific time. "
+            "Please extract or infer a deadline from the user's message. "
+            "Examples: 'tomorrow' → tomorrow at 12:00 PM, 'next week' → next Monday at 5:00 PM, "
+            "'later today' → today at 5:00 PM. If you truly cannot determine when, ask the user."
+        )
+        log_event("tool_error_no_deadline", {
+            "tool": "create_timer",
+            "label": label,
+            "error": "Missing deadline_iso parameter"
+        })
+        return {
+            "status": "error",
+            "error": error_msg,
+            "label": label
+        }
+
     log_event("tool_called", {
         "tool": "create_timer",
         "args": {"label": label, "deadline_iso": deadline_iso, "category": category, "destination": destination_address}
@@ -1509,286 +1531,188 @@ Once you determine the score, call submit_urgency_score_tool with your score and
 )
 
 # Extraction Agent - Specializes in parsing tasks from natural language
-extraction_agent = Agent(
-    name="extraction_agent",
+task_parser_agent = Agent(
+    name="task_parser_agent",
     model="gemini-2.5-flash",
-    description="Extracts structured timer/task information from natural language input",
+    description="Parses simple task information without locations - handles deadlines, categories, and timer management for non-location-based tasks",
     instruction="""
-You are the Extraction Agent, specialized in parsing task information from natural language.
+You are the Task Parser Agent. You handle simple tasks WITHOUT locations.
 
-Your job is to:
-1. Identify tasks, deadlines, and time-sensitive items in user messages
-2. Extract structured information (label, deadline, category, duration)
-3. ALWAYS check existing timers first using get_current_timers_tool
-4. Update existing timers if they match, or create new ones
+If the user mentions going somewhere, arriving at a place, or any location-based activity,
+respond: "This involves a location - please route to location_agent"
 
-IMPORTANT WORKFLOW:
-1. ALWAYS call get_current_timers_tool FIRST to see what tasks exist
-2. If user references existing tasks (e.g., "between X and Y", "after the meeting"), look them up by matching keywords in the timer labels
-3. Use the actual timer data (deadlines, IDs) to complete the requested action
-4. If user mentions a task that matches an existing active timer, UPDATE it
-5. If creating a new task, use create_timer_tool
-6. Always finish by taking the requested action (create/update/delete)
-
-CRITICAL: You MUST call create_timer_tool or update_timer_tool to complete the task. Never just report data without acting on it.
-
-Example - "between getting the mail and picking up willem, I need lunch":
-1. Call get_current_timers_tool → find "mail" timer (deadline 13:39) and "Willem" timer (deadline 14:44)
-2. Calculate midpoint: (13:39 + 14:44) / 2 ≈ 14:11
-3. Call create_timer_tool(label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal")
-4. Report success to user
-
-LOCATION-AWARE TIMERS (CRITICAL - READ CAREFULLY):
-
-WHEN TO USE calculate_travel_time_tool:
-Use this tool whenever the user mentions:
-- Going TO a location ("go to", "be at", "arrive at", "get to")
-- Leaving FOR a location ("leave for", "leave to be at", "head to", "drive to")
-- A specific address or place name WITH a time constraint
-- Examples that REQUIRE calculate_travel_time_tool:
-  * "leave to be at 4984 El Camino Real by 3:55pm"
-  * "go to Naschmarkt in Campbell at 3pm"
-  * "arrive at the dentist by 2pm"
-  * "be at the office by 9am"
-  * "get to the store by 5pm"
-
-CRITICAL: If you see ANY address or location WITH a time, you MUST use calculate_travel_time_tool FIRST.
-The timer deadline should be the DEPARTURE time (when to leave), NOT the arrival time!
+YOUR RESPONSIBILITIES:
+1. Parse task label, deadline, category, and duration from user messages
+2. Check existing timers and resolve fuzzy references
+3. Create or update timers (non-location tasks only)
+4. Handle recurring timer requests
 
 WORKFLOW:
-1. Identify the destination address from the message
-2. Identify the arrival time (when they need to BE THERE)
-3. Call calculate_travel_time_tool(destination="address", arrival_time_iso="ISO datetime")
-   - This calculates travel time with traffic and returns the DEPARTURE time
-4. Create timer using the DEPARTURE time as deadline:
-   - create_timer_tool(
-       label="Leave for [destination]",
-       deadline_iso=<departure_time_iso from calculate_travel_time_tool result>,
-       destination_address=<destination>,
-       origin_address=<origin from result>,
-       departure_time=<departure_time_iso>,
-       arrival_time=<arrival_time_iso>,
-       travel_time_minutes=<travel_time from result>,
-       distance_km=<distance from result>
-     )
+1. ALWAYS call get_current_timers_tool FIRST to see what exists
+2. Parse task details from the message:
+   - label: What the task is
+   - deadline_iso: When it's due (ISO 8601 format)
+   - category: work/personal/health/finance/maintenance/other
+   - is_appointment: true if fixed time commitment, false if flexible
+   - estimated_duration_minutes: For appointments, estimate or extract duration
+3. Check for fuzzy references ("that report", "between X and Y")
+4. Call create_timer_tool or update_timer_tool
+5. Report results, including any conflicts detected
 
-Example - "leave to be at 4984 El Camino Real, Los Altos by 3:55pm":
-1. Call calculate_travel_time_tool(
-     destination="4984 El Camino Real, Ste 208, Los Altos, CA",
-     arrival_time_iso="2025-11-18T15:55:00"
-   )
-2. Get result: {{
-     "departure_time_iso": "2025-11-18T15:30:00",  # When to LEAVE
-     "arrival_time_iso": "2025-11-18T15:55:00",    # When to ARRIVE
-     "travel_time_minutes": 25,
-     "distance_km": 12.3,
-     "origin_address": "San Jose, CA",
-     "destination_address": "4984 El Camino Real, Ste 208, Los Altos, CA"
-   }}
-3. Call create_timer_tool(
-     label="Leave for El Camino Real",
-     deadline_iso="2025-11-18T15:30:00",  # DEPARTURE time, NOT arrival time!
-     category="personal",
-     destination_address="4984 El Camino Real, Ste 208, Los Altos, CA",
-     origin_address="San Jose, CA",
-     departure_time="2025-11-18T15:30:00",
-     arrival_time="2025-11-18T15:55:00",
-     travel_time_minutes=25,
-     distance_km=12.3
-   )
+FUZZY REFERENCE EXAMPLE:
+"Between getting the mail and picking up Willem, I need lunch"
+1. get_current_timers_tool → find "mail" (13:39) and "Willem" (14:44)
+2. Calculate midpoint: 14:11
+3. create_timer_tool(label="Lunch", deadline_iso="2025-11-17T14:11:00", category="personal")
 
-Example - "remind me to leave for the dentist in Campbell by 2pm":
-1. Call calculate_travel_time_tool(destination="Dentist, Campbell, CA", arrival_time_iso="2025-11-17T14:00:00")
-2. Get result: departure_time_iso="2025-11-17T13:35:00", travel_time=25 minutes, distance=12.3 km
-3. Call create_timer_tool(
-     label="Leave for dentist",
-     deadline_iso="2025-11-17T13:35:00",  # DEPARTURE time
-     category="health",
-     destination_address="Dentist, Campbell, CA",
-     departure_time="2025-11-17T13:35:00",
-     arrival_time="2025-11-17T14:00:00",
-     travel_time_minutes=25,
-     distance_km=12.3
-   )
+RECURRING TIMERS:
+Create MULTIPLE timers by calling create_timer_tool multiple times:
+- "Once a day for 3 days" → 3 separate timers
+- "Every morning this week" → 5 timers (Mon-Fri)
 
-TIMELINE CONFLICT DETECTION:
+APPOINTMENT DETECTION:
+is_appointment=true for: doctor, dentist, meeting, pickup/dropoff, class, reservation
+is_appointment=false for: errands, chores, flexible tasks
 
-When you create a timer, the system automatically checks for spatiotemporal conflicts.
-The create_timer_tool response will include "has_conflicts" and "conflicts" fields.
+DURATION DEFAULTS (for appointments):
+- Doctor/Dentist: 45 min
+- Meeting: 60 min
+- Haircut: 30 min
+- Dinner/Lunch: 75 min
+- Class: 60 min
 
-If conflicts are detected, you MUST:
-1. Still create the timer (it's already been created)
-2. Alert the user about the conflicts
-3. Explain each conflict clearly
-4. Suggest solutions if possible
+CONFLICT & PROXIMITY REPORTING:
+When you create a timer, the system automatically checks for conflicts and proximity warnings.
+If the create_timer_tool response includes conflicts or proximity_warnings, report them clearly to the user.
 
-Conflict Types:
-- **location_overlap**: Different locations at nearly the same time
-- **impossible_timeline**: Need to leave before an earlier event ends
-- **insufficient_travel_time**: Not enough time to travel between locations
+DEADLINE PARSING (today is {today}, current time is {current_time}):
+CRITICAL: Every timer MUST have a deadline. "Timer with no deadline" is forbidden.
 
-Example Response with Conflicts:
-```
-Timer created: "Leave for Campbell meeting" at 2:30 PM
+Time reference examples:
+- "by Friday" → this Friday 17:00
+- "next week" → following Monday 17:00
+- "in 3 days" → 3 days from now 17:00
+- "tomorrow morning" → next day 09:00
+- "tomorrow" (no time) → tomorrow 12:00 (noon default)
+- "in 2 hours" → current time + 2 hours
+- "at 3pm" → today at 15:00 (or tomorrow if past)
+- "later" → today 17:00 (5 PM default)
+- "soon" → today + 3 hours
+- Default to 17:00 (5 PM) if no time specified
+- Default to 12:00 (noon) for vague future references
 
-⚠️ TIMELINE CONFLICT DETECTED:
-You have "Dentist in Los Altos" ending at 2:45 PM, but you need to leave for Campbell at 2:30 PM.
-This timeline is impossible - you would need to leave 15 minutes before the dentist appointment ends.
+MANDATORY: You MUST extract or infer a deadline for every task.
+- If the message contains ANY time reference (even vague like "tomorrow"), extract it
+- If truly ambiguous, use intelligent defaults based on task type:
+  * Grocery shopping: tomorrow 12:00
+  * Appointments: ask user for clarification if not specified
+  * Errands: tomorrow 17:00
+- NEVER call create_timer_tool with an empty deadline_iso
+- If you cannot determine a deadline at all, respond to the user asking when they need it done
 
-Suggestion: Reschedule the dentist appointment earlier, or move the Campbell meeting later.
-```
-
-IMPORTANT: Always report conflicts to the user in a clear, actionable way. Don't ignore them!
-
-PROXIMITY WARNINGS (Location Confirmation):
-
-When you create a timer, the system also checks for "nearby" events (within 3 hours).
-The create_timer_tool response will include "has_proximity_warnings" and "proximity_warnings" fields.
-
-Proximity warnings help prevent conflicts by proactively asking about locations when events are close in time.
-
-If proximity warnings are detected, you SHOULD:
-1. Acknowledge the timer was created
-2. Note the nearby event(s)
-3. Ask the user the suggested_question to confirm locations are compatible
-
-Warning Types by Severity:
-- **very_close** (< 30 min apart): High severity - ask immediately
-- **close** (30 min - 2 hours apart): Medium severity - confirm location
-- **nearby** (2-3 hours apart): Low severity - mention if relevant
-
-Example Response with Proximity Warning:
-```
-Timer created: "Meeting" at 2:00 PM
-
-📍 LOCATION CHECK:
-You have "Dentist appointment" at 3:30 PM (90 minutes later).
-- 'Meeting' has no location specified
-- 'Dentist appointment' is at 123 Main St, Campbell
-
-Where is the meeting? This will help me check if you have enough travel time between events.
-```
-
-IMPORTANT: Use proximity warnings to help the user avoid conflicts before they happen!
-
-APPOINTMENT vs TASK DETECTION:
-
-When creating a timer, you must determine if it's a **fixed appointment** or a **flexible task**.
-This distinction is critical for intelligent conflict resolution - the system can reschedule flexible tasks to accommodate fixed appointments.
-
-Set `is_appointment=True` for:
-- **Fixed time commitments** that can't be easily rescheduled:
-  * Medical appointments (dentist, doctor, specialist)
-  * Scheduled meetings (work meetings, video calls, appointments)
-  * Pickup/dropoff obligations (pick up Willem, get kids from school)
-  * Classes or lessons (piano lesson, yoga class, webinar)
-  * Reservations (restaurant, tickets, haircut)
-  * Scheduled events (conference, party, wedding)
-
-- **Indicators of appointments**:
-  * Specific times mentioned ("at 2:30PM", "at exactly 3:00")
-  * Appointment-related keywords (appointment, meeting, scheduled, reservation)
-  * Other people involved (meeting with X, pick up Y)
-  * Professional services (dentist, doctor, lawyer, mechanic)
-
-Set `is_appointment=False` for:
-- **Flexible tasks** that can be rescheduled:
-  * Personal errands (grocery store, pharmacy, post office)
-  * Household chores (clean room, do laundry, organize closet)
-  * Self-directed tasks (study, practice, exercise, read)
-  * Vague timing ("tomorrow", "this week", "when I can")
-  * No specific time commitment
-
-Examples:
-- "I need to go to the dentist at 2:30PM" → is_appointment=True (fixed time, professional service)
-- "Pick up Willem at 3:00PM" → is_appointment=True (pickup obligation, specific time)
-- "Meeting with Sarah at 10am" → is_appointment=True (scheduled meeting, other person)
-- "I need to go to the grocery store tomorrow" → is_appointment=False (flexible errand, vague timing)
-- "Clean my room this week" → is_appointment=False (household chore, no specific time)
-- "Leave for the gym around 6pm" → is_appointment=False ("around" = flexible timing)
-
-When in doubt:
-- If rescheduling would require contacting someone else or canceling → is_appointment=True
-- If you can do it whenever you want → is_appointment=False
-
-IMPORTANT: Always set the is_appointment parameter when calling create_timer_tool!
-
-APPOINTMENT DURATION EXTRACTION:
-
-For appointments, ALWAYS extract and set the `estimated_duration_minutes` parameter.
-This is critical for accurate conflict detection - the system needs to know when appointments END to calculate travel time.
-
-**How to extract duration:**
-- **Explicit duration mentioned:**
-  * "Dentist appointment at 2:30pm for 1 hour" → estimated_duration_minutes=60
-  * "30 minute meeting at 10am" → estimated_duration_minutes=30
-  * "Dinner from 6pm to 7:30pm" → estimated_duration_minutes=90
-  * "2 hour workshop starting at 1pm" → estimated_duration_minutes=120
-
-- **Typical appointment durations (when not specified):**
-  * Doctor/Dentist: 30-60 minutes (use 45 as default)
-  * Haircut: 30-45 minutes (use 30 as default)
-  * Meeting: 30-60 minutes (use 60 as default)
-  * Dinner/Lunch: 60-90 minutes (use 75 as default)
-  * Class/Lesson: 60 minutes (use 60 as default)
-
-- **For tasks (not appointments):**
-  * Use estimated_duration_minutes if user specifies effort required
-  * Otherwise, leave as 0 or omit
-
-**Examples:**
-```
-"Dentist at 2:30pm" → is_appointment=True, estimated_duration_minutes=45
-"30 minute standup at 9am" → is_appointment=True, estimated_duration_minutes=30
-"Dinner at Outback at 7pm" → is_appointment=True, estimated_duration_minutes=75
-"Pick up Willem at 3pm" → is_appointment=True, estimated_duration_minutes=5
-"Clean room tomorrow" → is_appointment=False, estimated_duration_minutes=0 (or omit)
-```
-
-IMPORTANT: Always set estimated_duration_minutes for appointments to enable accurate conflict detection!
-
-RECURRING/MULTIPLE TIMERS:
-If user requests recurring tasks or multiple instances, you MUST create MULTIPLE separate timers by calling create_timer_tool multiple times:
-- "Once a day for the next 3 days" → Create 3 timers with deadlines: tomorrow 09:00, day after 09:00, 2 days after 09:00
-- "Every morning this week" → Create 5 timers (Mon-Fri) at 09:00 each day
-- "Twice today" → Create 2 timers with different times today
-- "Monday, Wednesday, and Friday" → Create 3 separate timers
-
-IMPORTANT: Call create_timer_tool ONCE for EACH timer. Do not try to create multiple timers in a single call.
-
-For deadlines (today is {today}, current time is {current_time}):
-- "by Friday" = this Friday at 17:00
-- "next week" = following Monday at 17:00
-- "in 3 days" = 3 days from now at 17:00
-- "tomorrow morning" = next day at 09:00
-- "in 2 hours" = current time + 2 hours
-- "in 30 minutes" = current time + 30 minutes
-- "in about 2 and a half hours" = current time + 2.5 hours
-- "at 3pm" or "at 15:00" = today at that time (or tomorrow if already past)
-- If no time specified for day-based deadlines, default to 17:00
-- ALWAYS extract a deadline if ANY time reference is given, even approximate ones like "about", "around", "roughly"
-
-Categories:
-- work: job-related tasks, meetings, reports
+CATEGORIES:
+- work: job tasks, meetings, reports
 - personal: errands, social, hobbies
 - health: medical, exercise, wellness
 - finance: bills, taxes, budgeting
-- maintenance: home repairs, car service, cleaning
-- other: anything that doesn't fit above
+- maintenance: repairs, cleaning
+- other: everything else
 
-Status values:
-- active: task is pending/in progress
-- completed: task is done
-- deleted: task should be removed from view
+STATUS:
+- active: pending/in progress
+- completed: done
+- deleted: removed from view
 
 Always use ISO 8601 format for deadlines.
-Return a clear summary of what you did (created, updated, or deleted).
+Return a clear summary of what you did.
+
+REMEMBER: If user mentions a location, respond: "This involves a location - please route to location_agent"
 """.format(
         today=datetime.now().strftime("%A, %B %d, %Y"),
         current_time=datetime.now().strftime("%H:%M")
     ),
-    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool, calculate_travel_time_tool]
+    tools=[create_timer_tool, get_current_timers_tool, update_timer_tool]
 )
+
+# Location Agent - Handles all location-based timer creation
+location_agent = Agent(
+    name="location_agent",
+    model="gemini-2.5-flash",
+    description="Handles location-based tasks - calculates travel times, creates timers for departures and arrivals using Google Maps API",
+    instruction="""
+You are the Location Agent. You handle ALL tasks involving locations, addresses, and travel.
+
+YOUR RESPONSIBILITIES:
+1. Detect location mentions in user messages
+2. Calculate travel times using Google Maps API with real-time traffic
+3. Determine departure times based on arrival deadlines
+4. Create location-aware timers with all spatial metadata
+5. Report conflicts and proximity warnings
+
+WHEN TO ACTIVATE:
+User mentions: "go to", "be at", "arrive at", "leave for", "head to", any address or place name with a time
+
+WORKFLOW:
+1. Parse destination and arrival time from message
+2. Call calculate_travel_time_tool(destination, arrival_time_iso)
+3. Get departure_time, travel_time, distance, addresses
+4. Call create_timer_tool with ALL location fields:
+   - label: "Leave for [destination]"
+   - deadline_iso: departure_time (when to LEAVE, not arrive!)
+   - destination_address, origin_address
+   - departure_time, arrival_time
+   - travel_time_minutes, distance_km
+   - is_appointment, estimated_duration_minutes
+5. Report results including conflicts/proximity warnings
+
+CRITICAL: Timer deadline = DEPARTURE time, NOT arrival time!
+
+EXAMPLE - "Leave for dentist in Campbell by 2pm":
+1. calculate_travel_time_tool(
+     destination="Dentist, Campbell, CA",
+     arrival_time_iso="2025-11-17T14:00:00"
+   )
+2. Result: departure_time="13:35", travel=25min, distance=12.3km
+3. create_timer_tool(
+     label="Leave for dentist",
+     deadline_iso="2025-11-17T13:35:00",  # DEPARTURE time!
+     destination_address="Dentist, Campbell, CA",
+     departure_time="2025-11-17T13:35:00",
+     arrival_time="2025-11-17T14:00:00",
+     travel_time_minutes=25,
+     distance_km=12.3,
+     is_appointment=true,
+     estimated_duration_minutes=45
+   )
+
+APPOINTMENT DURATION:
+For appointments at locations, estimate duration:
+- Doctor/Dentist: 45 min
+- Meeting: 60 min
+- Haircut: 30 min
+- Dinner/Lunch: 75 min
+- Pickup (e.g., "pick up Willem"): 5 min
+
+CONFLICT/PROXIMITY REPORTING:
+If create_timer_tool returns conflicts or proximity_warnings, explain clearly:
+- What the conflict is
+- Why it's impossible
+- Suggest solutions
+
+DEADLINE PARSING (today is {today}, current time is {current_time}):
+Same rules as task_parser_agent - extract ISO 8601 timestamps
+
+Always use ISO 8601 format. Report travel details and any conflicts clearly.
+""".format(
+        today=datetime.now().strftime("%A, %B %d, %Y"),
+        current_time=datetime.now().strftime("%H:%M")
+    ),
+    tools=[calculate_travel_time_tool, create_timer_tool, get_current_timers_tool, update_timer_tool]
+)
+
+# Keep extraction_agent as alias for backward compatibility during transition
+extraction_agent = location_agent
+
 
 # Memory & Learning Agent - Learns user preferences and notable facts
 # Instantiate memory tools
@@ -1878,31 +1802,27 @@ Your job is to:
 3. Synthesize responses and provide a unified experience
 
 Delegation guidelines:
-- If request involves ANY timer operations (create, update, delete, query) → delegate to extraction_agent
-- If user expresses preferences/priorities/importance → delegate to preference_agent
-- If user just wants to see current timers → you can use get_current_timers_tool directly OR delegate to extraction_agent
-
-The extraction_agent is smart enough to handle:
-- Simple new tasks with explicit deadlines
-- Fuzzy references ("that report", "it", "the meeting")
-- Multi-task references ("between X and Y", "after the meeting")
-- Updates using timer IDs
-- Complex multi-step task creation
+- Location-based tasks ("go to", "arrive at", "leave for") → location_agent
+- Simple tasks without locations → task_parser_agent
+- Preferences/priorities/learning → preference_agent
+- Just viewing timers → get_current_timers_tool directly
 
 Examples:
-- "I need to pick up Willem at 3pm" → extraction_agent
-- "Change that report deadline to Thursday" → extraction_agent
-- "Between getting the mail and picking up Willem, I need lunch" → extraction_agent
+- "Leave for dentist in Campbell by 2pm" → location_agent
+- "I need to finish the report by Friday" → task_parser_agent
+- "Between getting mail and picking up Willem, I need lunch" → task_parser_agent
 - "Health is my top priority" → preference_agent
-- "Update timer_id 42 to be due tomorrow" → extraction_agent
-- "What timers do I have?" → get_current_timers_tool OR extraction_agent
+- "What timers do I have?" → get_current_timers_tool
 
-Keep it simple: timers → extraction_agent, preferences → preference_agent.
+Keep it simple:
+- Locations → location_agent
+- Tasks → task_parser_agent
+- Preferences → preference_agent
 
 Today is {today}.
 """.format(today=datetime.now().strftime("%A, %B %d, %Y")),
     tools=[get_current_timers_tool],
-    sub_agents=[extraction_agent, preference_agent]
+    sub_agents=[task_parser_agent, location_agent, preference_agent]
 )
 
 # Create session and memory services (Google ADK)
@@ -1921,8 +1841,9 @@ runner = Runner(
 
 log_event("adk_multi_agent_initialized", {
     "root_agent": "timermind_orchestrator",
-    "sub_agents": ["extraction_agent", "preference_agent"],
-    "extraction_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool", "calculate_travel_time_tool"],
+    "sub_agents": ["task_parser_agent", "location_agent", "preference_agent"],
+    "task_parser_tools": ["create_timer_tool", "get_current_timers_tool", "update_timer_tool"],
+    "location_tools": ["calculate_travel_time_tool", "create_timer_tool", "get_current_timers_tool", "update_timer_tool"],
     "preference_tools": ["get_user_preferences_tool", "add_preference_rule_tool", "set_default_location_tool", "get_current_timers_tool", "recalculate_timer_importance_tool", "load_memory", "preload_memory"],
     "session_service": "InMemorySessionService",
     "memory_service": "InMemoryMemoryService (Google ADK memory banks)",
@@ -1938,6 +1859,9 @@ app = FastAPI(
     description="AI-powered task prioritization agent",
     version="0.1.0"
 )
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class ChatRequest(BaseModel):
     message: str
@@ -2168,6 +2092,98 @@ async def reset_data():
 
     log_event("data_reset_completed", {"timers_cleared": True, "preferences_cleared": True})
     return {"status": "reset", "message": "All timers and preferences cleared"}
+
+class MemoriesRequest(BaseModel):
+    session_id: Optional[str] = None
+
+@app.post("/api/memories")
+async def get_memories(request: MemoriesRequest):
+    """
+    Retrieve memories from the Google ADK memory service for the current session.
+
+    Returns:
+        dict with list of memory objects
+    """
+    try:
+        user_id = "default_user"
+        session_id = request.session_id
+
+        if not session_id:
+            return {"memories": [], "count": 0, "message": "No session ID provided"}
+
+        # Query memories from the memory service using search_memory
+        # We'll search for all memories by using a broad query
+        memories_list = []
+
+        try:
+            # Use the memory service's search_memory method
+            # Search with a broad query to get all memories
+            search_response = await memory_service.search_memory(
+                app_name="timermind",
+                user_id=user_id,
+                query=""  # Empty query should return all memories
+            )
+
+            # Extract memories from the search response
+            if hasattr(search_response, 'memories') and search_response.memories:
+                for memory_chunk in search_response.memories:
+                    # Each memory chunk has content
+                    content = ""
+                    if hasattr(memory_chunk, 'content'):
+                        if hasattr(memory_chunk.content, 'parts'):
+                            # Extract text from parts
+                            for part in memory_chunk.content.parts:
+                                if hasattr(part, 'text'):
+                                    content += part.text
+                        elif hasattr(memory_chunk.content, 'text'):
+                            content = memory_chunk.content.text
+                        else:
+                            content = str(memory_chunk.content)
+
+                    # Get timestamp if available
+                    created_at = datetime.now().isoformat()
+                    if hasattr(memory_chunk, 'create_time'):
+                        created_at = memory_chunk.create_time
+                    elif hasattr(memory_chunk, 'timestamp'):
+                        created_at = memory_chunk.timestamp
+
+                    if content:
+                        memories_list.append({
+                            "content": content,
+                            "created_at": created_at,
+                            "type": "memory"
+                        })
+
+        except Exception as e:
+            log_event("memory_retrieval_error", {"error": str(e), "type": type(e).__name__})
+            # Return empty list with info message if search fails
+            return {
+                "memories": [],
+                "count": 0,
+                "message": f"Could not retrieve memories: {str(e)}",
+                "info": "Memories are stored when you share preferences with the agent."
+            }
+
+        log_event("memories_retrieved", {
+            "session_id": session_id,
+            "user_id": user_id,
+            "count": len(memories_list)
+        })
+
+        return {
+            "memories": memories_list,
+            "count": len(memories_list),
+            "session_id": session_id
+        }
+
+    except Exception as e:
+        import traceback
+        log_event("memories_error", {
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        })
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
 # Main Entry Point

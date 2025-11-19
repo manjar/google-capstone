@@ -28,6 +28,8 @@ body {
     padding: 20px;
     display: flex;
     flex-direction: column;
+    height: 100%;
+    overflow: hidden;
 }
 
 .panel h2 {
@@ -37,12 +39,7 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
-}
-
-.left-column {
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
+    flex-shrink: 0;
 }
 
 /* Chat Panel */
@@ -81,23 +78,24 @@ body {
 
 .tab-content {
     display: none;
+    flex-direction: column;
     flex: 1;
-    overflow-y: auto;
+    overflow: hidden;
     border: 1px solid #ddd;
     border-radius: 4px;
-    padding: 10px;
     background: #fafafa;
-    max-height: 400px;
-    min-height: 200px;
+    min-height: 0;
 }
 
 .tab-content.active {
-    display: block;
+    display: flex;
 }
 
 .chat-messages {
     flex: 1;
     overflow-y: auto;
+    min-height: 0;
+    padding: 10px;
 }
 
 .thought-process {
@@ -195,6 +193,14 @@ body {
 .timers-list {
     flex: 1;
     overflow-y: auto;
+    padding: 10px;
+    margin: 0;
+    min-height: 0;
+}
+
+#timersTabContent .timers-list,
+#timelineTabContent .timeline-view {
+    padding: 10px;
 }
 
 .timer-item {
@@ -490,6 +496,117 @@ body {
     text-align: center;
     padding: 20px;
     font-style: italic;
+}
+
+/* Timeline View */
+.timeline-view {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0;
+}
+
+.timeline-container {
+    position: relative;
+    padding-left: 80px;
+}
+
+.timeline-ruler {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 70px;
+    border-right: 2px solid #ddd;
+}
+
+.timeline-hour {
+    height: 60px;
+    border-bottom: 1px solid #eee;
+    padding: 2px 5px;
+    font-size: 0.75em;
+    color: #666;
+    text-align: right;
+}
+
+.timeline-hour.current {
+    background: #fff3cd;
+    font-weight: 600;
+}
+
+.timeline-content {
+    position: relative;
+    min-height: 100%;
+}
+
+.timeline-block {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 0.85em;
+    overflow: hidden;
+    cursor: pointer;
+    transition: all 0.2s;
+    border-left: 4px solid;
+}
+
+.timeline-block:hover {
+    transform: translateX(2px);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+
+.timeline-block.free {
+    background: #f0f0f0;
+    border-left-color: #aaa;
+    color: #666;
+    font-style: italic;
+}
+
+.timeline-block.transit {
+    background: #fff3cd;
+    border-left-color: #ffc107;
+    color: #856404;
+}
+
+.timeline-block.event {
+    background: #d1ecf1;
+    border-left-color: #17a2b8;
+    color: #0c5460;
+}
+
+.timeline-block.appointment {
+    background: #d4edda;
+    border-left-color: #28a745;
+    color: #155724;
+}
+
+.timeline-block.urgent {
+    background: #f8d7da;
+    border-left-color: #dc3545;
+    color: #721c24;
+}
+
+.timeline-block-title {
+    font-weight: 600;
+    margin-bottom: 2px;
+}
+
+.timeline-block-time {
+    font-size: 0.75em;
+    opacity: 0.8;
+}
+
+.timeline-day-header {
+    position: sticky;
+    top: 0;
+    background: #007bff;
+    color: white;
+    padding: 8px 10px;
+    font-weight: 600;
+    z-index: 10;
+    margin-left: -10px;
+    margin-right: -10px;
+    margin-bottom: 5px;
 }
 
 @media (max-width: 1024px) {

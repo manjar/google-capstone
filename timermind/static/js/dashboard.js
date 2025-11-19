@@ -1,6 +1,7 @@
 let currentSessionId = null;
 let thoughtProcessLog = [];
 let timerRationales = new Map(); // Store rationales by timer ID
+let cachedTimers = []; // Cache timers for timeline rendering
 
 // Load initial data
 window.onload = function() {
@@ -175,6 +176,9 @@ async function loadTimers() {
 
 function updateTimersList(timers) {
     const listDiv = document.getElementById('timersList');
+
+    // Cache timers for timeline view
+    cachedTimers = timers || [];
 
     if (!timers || timers.length === 0) {
         listDiv.innerHTML = '<div class="empty-state">No timers yet. Start by telling me about your tasks!</div>';
@@ -518,4 +522,212 @@ function addMemoryEvent(toolName, content) {
 
     memoriesDiv.appendChild(memoryItem);
     memoriesDiv.scrollTop = memoriesDiv.scrollHeight;
+}
+
+// Timeline View Functions
+
+function switchTimersTab(tabName, event) {
+    // Remove active class from all tabs in the timers panel
+    const timersTabs = document.querySelectorAll('.panel:last-child .tab');
+    timersTabs.forEach(tab => tab.classList.remove('active'));
+
+    // Add active class to selected tab
+    if (event && event.target) {
+        event.target.classList.add('active');
+    }
+
+    // Hide all tab content
+    document.getElementById('timersTabContent').classList.remove('active');
+    document.getElementById('timelineTabContent').classList.remove('active');
+
+    // Show selected tab content
+    if (tabName === 'timers') {
+        document.getElementById('timersTabContent').classList.add('active');
+    } else if (tabName === 'timeline') {
+        document.getElementById('timelineTabContent').classList.add('active');
+        renderTimeline();
+    }
+}
+
+function renderTimeline() {
+    const timelineView = document.getElementById('timelineView');
+
+    if (!cachedTimers || cachedTimers.length === 0) {
+        timelineView.innerHTML = '<div class="empty-state">No events scheduled. Timeline will appear here.</div>';
+        return;
+    }
+
+    // Build timeline blocks from timers
+    const blocks = buildTimelineBlocks(cachedTimers);
+
+    if (blocks.length === 0) {
+        timelineView.innerHTML = '<div class="empty-state">No upcoming events in the next 48 hours.</div>';
+        return;
+    }
+
+    // Render timeline
+    const html = renderTimelineHTML(blocks);
+    timelineView.innerHTML = html;
+}
+
+function buildTimelineBlocks(timers) {
+    const now = new Date();
+    const endTime = new Date(now.getTime() + 48 * 60 * 60 * 1000); // 48 hours from now
+    const blocks = [];
+
+    // Sort timers by deadline
+    const sortedTimers = timers
+        .filter(t => t.deadline)
+        .map(t => ({
+            ...t,
+            deadlineDate: new Date(t.deadline)
+        }))
+        .filter(t => t.deadlineDate >= now && t.deadlineDate <= endTime)
+        .sort((a, b) => a.deadlineDate - b.deadlineDate);
+
+    // Track last block end time to create "free" blocks
+    let currentTime = now;
+
+    for (const timer of sortedTimers) {
+        const timerStart = timer.deadlineDate;
+
+        // Determine duration and type based on label/category
+        const isTransit = timer.label.toLowerCase().includes('leave') ||
+                         timer.label.toLowerCase().includes('depart') ||
+                         timer.category === 'transit';
+
+        let duration = 30; // Default 30 minutes for events
+        let blockType = 'event';
+
+        if (isTransit) {
+            // Transit blocks - extract duration from metadata if available
+            duration = 30; // Default transit time
+            blockType = 'transit';
+        } else if (timer.label.toLowerCase().includes('appointment')) {
+            duration = 60; // 1 hour for appointments
+            blockType = 'appointment';
+        }
+
+        const timerEnd = new Date(timerStart.getTime() + duration * 60 * 1000);
+
+        // Add free time block if there's a gap
+        if (currentTime < timerStart) {
+            blocks.push({
+                type: 'free',
+                start: currentTime,
+                end: timerStart,
+                label: 'Free time'
+            });
+        }
+
+        // Add timer block
+        blocks.push({
+            type: blockType,
+            start: timerStart,
+            end: timerEnd,
+            label: timer.label,
+            timer: timer
+        });
+
+        currentTime = timerEnd;
+    }
+
+    // Add final free time block if there's time left
+    if (currentTime < endTime) {
+        blocks.push({
+            type: 'free',
+            start: currentTime,
+            end: endTime,
+            label: 'Free time'
+        });
+    }
+
+    return blocks;
+}
+
+function renderTimelineHTML(blocks) {
+    if (blocks.length === 0) return '';
+
+    const startTime = blocks[0].start;
+    const endTime = blocks[blocks.length - 1].end;
+
+    // Calculate hour range
+    const startHour = startTime.getHours();
+    const endHour = Math.ceil((endTime.getTime() - startTime.getTime()) / (60 * 60 * 1000)) + startHour;
+
+    // Build time ruler
+    let rulerHTML = '';
+    let currentDate = new Date(startTime);
+    currentDate.setMinutes(0, 0, 0);
+
+    const hours = [];
+    for (let h = 0; h < (endHour - startHour + 2); h++) {
+        const hour = new Date(currentDate.getTime() + h * 60 * 60 * 1000);
+        hours.push(hour);
+
+        const hourText = hour.toLocaleTimeString('en-US', {
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true
+        });
+
+        const isCurrentHour = (hour.getHours() === new Date().getHours() &&
+                               hour.getDate() === new Date().getDate());
+
+        rulerHTML += `<div class="timeline-hour ${isCurrentHour ? 'current' : ''}">${hourText}</div>`;
+    }
+
+    // Build blocks
+    let blocksHTML = '';
+    let lastDay = null;
+
+    for (const block of blocks) {
+        // Check if we need a day header
+        const blockDay = block.start.toLocaleDateString('en-US', {
+            weekday: 'long',
+            month: 'short',
+            day: 'numeric'
+        });
+
+        if (blockDay !== lastDay) {
+            const topPosition = ((block.start - hours[0]) / (60 * 60 * 1000)) * 60;
+            blocksHTML += `<div class="timeline-day-header" style="top: ${topPosition}px">${blockDay}</div>`;
+            lastDay = blockDay;
+        }
+
+        // Calculate position and height
+        const topPosition = ((block.start - hours[0]) / (60 * 60 * 1000)) * 60; // 60px per hour
+        const duration = (block.end - block.start) / (60 * 60 * 1000); // hours
+        const height = Math.max(duration * 60, 20); // Minimum 20px height
+
+        const startTimeStr = block.start.toLocaleTimeString('en-US', {
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true
+        });
+        const endTimeStr = block.end.toLocaleTimeString('en-US', {
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true
+        });
+
+        // Determine urgency class
+        const urgencyClass = block.timer && block.timer.urgency_score > 0.7 ? 'urgent' : '';
+
+        blocksHTML += `
+            <div class="timeline-block ${block.type} ${urgencyClass}"
+                 style="top: ${topPosition}px; height: ${height}px"
+                 title="${block.label}: ${startTimeStr} - ${endTimeStr}">
+                <div class="timeline-block-title">${block.label}</div>
+                <div class="timeline-block-time">${startTimeStr} - ${endTimeStr}</div>
+            </div>
+        `;
+    }
+
+    return `
+        <div class="timeline-container">
+            <div class="timeline-ruler">${rulerHTML}</div>
+            <div class="timeline-content">${blocksHTML}</div>
+        </div>
+    `;
 }

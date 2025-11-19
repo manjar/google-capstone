@@ -2,73 +2,71 @@
 
 {% block content %}
 <div class="container">
-    <div class="left-column">
-        <!-- Chat Panel -->
-        <div class="panel chat-container">
-            <h2>Chat with TimerMind</h2>
-            <div class="tab-container">
-                <button class="tab active" onclick="switchTab('chat')">Chat</button>
-                <button class="tab" onclick="switchTab('thoughts')">Thought Process</button>
-                <button class="tab" onclick="switchTab('memories')">Memories</button>
-            </div>
-            <div class="tab-content active" id="chatTab">
-                <div class="chat-messages" id="chatMessages">
-                    <div class="message assistant">
-                        Hello! I'm TimerMind. Tell me about tasks you need to track, or let me know your priorities. For example:
-                        <br><br>
-                        • "I need to submit my report by Friday"<br>
-                        • "Schedule a dentist appointment for next week"<br>
-                        • "Health is more important than work for me"
-                    </div>
-                </div>
-            </div>
-            <div class="tab-content" id="thoughtsTab">
-                <div class="thought-process" id="thoughtProcess">
-                    <div class="thought-item">
-                        <div class="event-type">Waiting for activity...</div>
-                        <div>Send a message to see the agent's thought process and tool calls.</div>
-                    </div>
-                </div>
-            </div>
-            <div class="tab-content" id="memoriesTab">
-                <div class="thought-process" id="memoriesDisplay">
-                    <div class="thought-item">
-                        <div class="event-type">No memories yet...</div>
-                        <div>Memories will appear here as the agent learns about your preferences and context.</div>
-                    </div>
-                </div>
-            </div>
-            <div class="chat-input">
-                <input type="text" id="userInput" placeholder="Type your message..."
-                       onkeypress="if(event.key==='Enter') sendMessage()">
-                <button onclick="sendMessage()" id="sendBtn">Send</button>
-            </div>
-            <div class="session-info" id="sessionInfo">Session: None</div>
+    <!-- Chat Panel -->
+    <div class="panel chat-container">
+        <h2>Chat with TimerMind</h2>
+        <div class="tab-container">
+            <button class="tab active" onclick="switchTab('chat')">Chat</button>
+            <button class="tab" onclick="switchTab('thoughts')">Thought Process</button>
+            <button class="tab" onclick="switchTab('memories')">Memories</button>
         </div>
-
-        <!-- Preferences Panel -->
-        <div class="panel">
-            <h2>
-                Preferences
-                <button class="btn btn-secondary" onclick="loadPreferences()">Refresh</button>
-            </h2>
-            <div class="preferences-content" id="preferencesContent">
-                <div class="empty-state">Loading preferences...</div>
+        <div class="tab-content active" id="chatTab">
+            <div class="chat-messages" id="chatMessages">
+                <div class="message assistant">
+                    Hello! I'm TimerMind. Tell me about tasks you need to track, or let me know your priorities. For example:
+                    <br><br>
+                    • "I need to submit my report by Friday"<br>
+                    • "Schedule a dentist appointment for next week"<br>
+                    • "Health is more important than work for me"
+                </div>
             </div>
         </div>
+        <div class="tab-content" id="thoughtsTab">
+            <div class="thought-process" id="thoughtProcess">
+                <div class="thought-item">
+                    <div class="event-type">Waiting for activity...</div>
+                    <div>Send a message to see the agent's thought process and tool calls.</div>
+                </div>
+            </div>
+        </div>
+        <div class="tab-content" id="memoriesTab">
+            <div class="thought-process" id="memoriesDisplay">
+                <div class="thought-item">
+                    <div class="event-type">No memories yet...</div>
+                    <div>Memories will appear here as the agent learns about your preferences and context.</div>
+                </div>
+            </div>
+        </div>
+        <div class="chat-input">
+            <input type="text" id="userInput" placeholder="Type your message..."
+                   onkeypress="if(event.key==='Enter') sendMessage()">
+            <button onclick="sendMessage()" id="sendBtn">Send</button>
+        </div>
+        <div class="session-info" id="sessionInfo">Session: None</div>
     </div>
 
-    <!-- Timers Panel -->
+    <!-- Timers Panel with Tabs -->
     <div class="panel">
         <h2>
-            Active Timers
+            Schedule View
             <span>
                 <button class="btn btn-secondary" onclick="loadTimers()">Refresh</button>
                 <button class="btn btn-danger" onclick="resetData()">Reset All</button>
             </span>
         </h2>
-        <div class="timers-list" id="timersList">
-            <div class="empty-state">No timers yet. Start by telling me about your tasks!</div>
+        <div class="tab-container">
+            <button class="tab active" onclick="switchTimersTab('timers', event)">Timers</button>
+            <button class="tab" onclick="switchTimersTab('timeline', event)">Timeline</button>
+        </div>
+        <div class="tab-content active" id="timersTabContent">
+            <div class="timers-list" id="timersList">
+                <div class="empty-state">No timers yet. Start by telling me about your tasks!</div>
+            </div>
+        </div>
+        <div class="tab-content" id="timelineTabContent">
+            <div class="timeline-view" id="timelineView">
+                <div class="empty-state">No events scheduled. Timeline will appear here.</div>
+            </div>
         </div>
     </div>
 </div>

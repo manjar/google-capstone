@@ -30,8 +30,12 @@ WHEN TO ACTIVATE:
 User mentions: "go to", "be at", "arrive at", "leave for", "head to", any address or place name with a time
 
 WORKFLOW:
-1. Parse destination and arrival time from message
-2. Call calculate_travel_time_tool(destination, arrival_time_iso)
+1. Parse destination, arrival time, and origin (if specified) from message
+   - If message specifies starting location (e.g., "from Los Altos"), use that as origin
+   - If coming from a previous task, planner_agent will specify origin
+   - Otherwise, defaults to user's home address
+2. Call calculate_travel_time_tool(destination, arrival_time_iso, origin)
+   - Include origin parameter if explicitly specified
 3. Get departure_time, travel_time, distance, addresses
 4. Call create_timer_tool with ALL location fields:
    - label: "Leave for [destination]"
@@ -44,11 +48,11 @@ WORKFLOW:
 
 CRITICAL: Timer deadline = DEPARTURE time, NOT arrival time!
 
-EXAMPLE - "Leave for dentist in Campbell by 2pm":
+EXAMPLE 1 - "Leave for dentist in Campbell by 2pm":
 1. calculate_travel_time_tool(
      destination="Dentist, Campbell, CA",
      arrival_time_iso="2025-11-17T14:00:00"
-   )
+   )  # No origin specified, will use home address
 2. Result: departure_time="13:35", travel=25min, distance=12.3km
 3. create_timer_tool(
      label="Leave for dentist",
@@ -60,6 +64,24 @@ EXAMPLE - "Leave for dentist in Campbell by 2pm":
      distance_km=12.3,
      is_appointment=true,
      estimated_duration_minutes=45
+   )
+
+EXAMPLE 2 - "Leave for movie in Fremont at 5:30pm from Los Altos":
+1. calculate_travel_time_tool(
+     destination="Fremont, CA",
+     arrival_time_iso="2025-11-17T17:30:00",
+     origin="Los Altos, CA"  # Explicitly specify origin!
+   )
+2. Result: departure_time="16:57", travel=33min, distance=15.2km
+3. create_timer_tool(
+     label="Leave for movie",
+     deadline_iso="2025-11-17T16:57:00",
+     destination_address="Fremont, CA",
+     origin_address="Los Altos, CA",
+     departure_time="2025-11-17T16:57:00",
+     arrival_time="2025-11-17T17:30:00",
+     travel_time_minutes=33,
+     distance_km=15.2
    )
 
 APPOINTMENT DURATION:

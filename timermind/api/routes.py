@@ -25,13 +25,14 @@ from utils.logging import log_event
 jinja_env = Environment(loader=FileSystemLoader(TEMPLATES_DIR))
 
 
-def register_routes(app, runner):
+def register_routes(app, runner, memory_watcher_runner):
     """
     Register all FastAPI routes with the application.
 
     Args:
         app: FastAPI application instance
         runner: ADK Runner instance for agent execution
+        memory_watcher_runner: ADK Runner for memory watcher agent (parallel memory capture)
     """
 
     @app.get("/", response_class=HTMLResponse)
@@ -74,8 +75,8 @@ def register_routes(app, runner):
             user_id = "default_user"  # TODO: Implement proper user management
             session_id = request.session_id
 
-            # Import session_service from orchestrator
-            from agents.orchestrator import session_service
+            # Import session_service and memory_service from orchestrator
+            from agents.orchestrator import session_service, memory_service
 
             if not session_id:
                 # Create new session
@@ -186,6 +187,53 @@ def register_routes(app, runner):
             if not response_text:
                 response_text = "I processed your request."
 
+            # Run memory watcher in parallel to capture notable facts
+            # This runs silently and doesn't affect the user response
+            log_event("memory_watcher_start", {"session_id": session_id})
+            memory_watcher_events = []
+            try:
+                async for event in memory_watcher_runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=types.Content(
+                        role="user",
+                        parts=[types.Part(text=request.message)]  # Use original message without time context
+                    )
+                ):
+                    # Track all events from memory watcher for debugging
+                    event_type = type(event).__name__
+                    memory_watcher_events.append(event_type)
+
+                    # Check for tool calls (function calls)
+                    if hasattr(event, "content") and event.content:
+                        if hasattr(event.content, "parts") and event.content.parts:
+                            for part in event.content.parts:
+                                if hasattr(part, "function_call") and part.function_call:
+                                    tool_name = part.function_call.name
+                                    log_event("memory_watcher_tool_call", {
+                                        "tool": tool_name,
+                                        "session_id": session_id
+                                    })
+                                if hasattr(part, "text") and part.text:
+                                    # Log any text output from memory watcher
+                                    log_event("memory_watcher_output", {
+                                        "text": part.text[:200],
+                                        "session_id": session_id
+                                    })
+
+                log_event("memory_watcher_complete", {
+                    "session_id": session_id,
+                    "events_count": len(memory_watcher_events),
+                    "event_types": list(set(memory_watcher_events))
+                })
+
+                # NOTE: Session is automatically saved to memory via the orchestrator's
+                # after_agent_callback - no manual save needed here!
+
+            except Exception as e:
+                # Don't let memory watcher errors break the main response
+                log_event("memory_watcher_error", {"error": str(e)})
+
             # Get updated timers
             updated_timers = list_timers_from_db()
 
@@ -275,11 +323,12 @@ def register_routes(app, runner):
 
             try:
                 # Use the memory service's search_memory method
-                # Search with a broad query to get all memories
+                # NOTE: InMemoryMemoryService uses keyword matching - empty queries return nothing!
+                # Use a broad query that will match common words in stored conversations
                 search_response = await memory_service.search_memory(
                     app_name="timermind",
                     user_id=user_id,
-                    query=""  # Empty query should return all memories
+                    query="user preferences address schedule tasks timers"  # Broad query to match stored content
                 )
 
                 # Extract memories from the search response

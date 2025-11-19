@@ -22,6 +22,9 @@ from database.migrations import run_all_migrations
 # Import agent orchestrator and runner
 from agents.orchestrator import runner
 
+# Import memory watcher runner
+from agents.memory_watcher_runner import memory_watcher_runner
+
 # Import API routes
 from api.routes import register_routes
 
@@ -50,7 +53,7 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Register all API routes
-register_routes(app, runner)
+register_routes(app, runner, memory_watcher_runner)
 
 # =============================================================================
 # Main Entry Point

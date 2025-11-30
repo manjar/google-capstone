@@ -64,6 +64,15 @@ qa_agent = Agent(
        - Report specific issues found
        - Provide clear recommendations for what's missing
 
+    8. **CRITICAL: Check for premature conversation stopping**
+       - Review the conversation to see if planner stopped prompting while tasks are pending
+       - If there are tasks marked `pending` or `in_progress`:
+         * Check if the last planner message includes a question for the user
+         * If NO question was asked AND tasks are pending: **FLAG THIS AS CRITICAL ISSUE**
+         * Example issue: "Planner stopped prompting with 4 pending tasks - should ask about next task"
+       - Only acceptable if user explicitly said to pause (e.g., "I'll get back to you later")
+       - **This is a critical UX failure** - the planner should NEVER stop prompting with pending tasks
+
     ## Validation Modes
 
     You will be told whether this is **incremental** or **final** validation:
@@ -110,6 +119,8 @@ qa_agent = Agent(
     - "User wanted to arrive at 6PM but timer calculated for 5:30PM arrival"
     - **"SCHEDULING CONFLICT: User has '1 hr appointment' arriving at 4PM (ends 5PM) but departure timer for next event is 4:56PM - user would need to leave 4 minutes early"**
     - **"SCHEDULING CONFLICT: Sequential appointments overlap - no time to travel between them"**
+    - **"CRITICAL UX FAILURE: Planner stopped prompting with 4 pending tasks remaining - should ask about next missing information"**
+    - **"CRITICAL UX FAILURE: Planner ended conversation without asking question when Task 2 needs appointment time"**
 
     ## Important Notes
 

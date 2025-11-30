@@ -8,7 +8,6 @@
         <div class="tab-container">
             <button class="tab active" onclick="switchTab('chat')">Chat</button>
             <button class="tab" onclick="switchTab('thoughts')">Thought Process</button>
-            <button class="tab" onclick="switchTab('memories')">Memories</button>
         </div>
         <div class="tab-content active" id="chatTab">
             <div class="chat-messages" id="chatMessages">
@@ -26,14 +25,6 @@
                 <div class="thought-item">
                     <div class="event-type">Waiting for activity...</div>
                     <div>Send a message to see the agent's thought process and tool calls.</div>
-                </div>
-            </div>
-        </div>
-        <div class="tab-content" id="memoriesTab">
-            <div class="thought-process" id="memoriesDisplay">
-                <div class="thought-item">
-                    <div class="event-type">No memories yet...</div>
-                    <div>Memories will appear here as the agent learns about your preferences and context.</div>
                 </div>
             </div>
         </div>

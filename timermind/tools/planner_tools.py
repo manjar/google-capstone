@@ -33,7 +33,16 @@ def create_task_list_tool(
     """
     try:
         tasks = json.loads(initial_tasks)
-        
+
+        # Ensure all tasks have an ID field
+        for i, task in enumerate(tasks):
+            if "id" not in task:
+                task["id"] = i + 1
+            if "created_at" not in task:
+                task["created_at"] = datetime.now(timezone.utc).isoformat()
+            if "updated_at" not in task:
+                task["updated_at"] = datetime.now(timezone.utc).isoformat()
+
         _task_store[session_id] = {
             "tasks": tasks,
             "user_message": user_message,
@@ -126,13 +135,28 @@ def update_task_status_tool(
         "new_status": new_status,
         "task_label": task["label"]
     })
-    
+
+    # Calculate remaining tasks by status
+    pending_tasks = [t for t in task_data["tasks"] if t["status"] == "pending"]
+    ready_tasks = [t for t in task_data["tasks"] if t["status"] == "ready"]
+    completed_tasks = [t for t in task_data["tasks"] if t["status"] == "completed"]
+    abandoned_tasks = [t for t in task_data["tasks"] if t["status"] == "abandoned"]
+
     return {
         "success": True,
         "task_id": task_id,
         "old_status": old_status,
         "new_status": new_status,
-        "task": task
+        "task": task,
+        "remaining_summary": {
+            "pending_count": len(pending_tasks),
+            "ready_count": len(ready_tasks),
+            "completed_count": len(completed_tasks),
+            "abandoned_count": len(abandoned_tasks),
+            "total_count": len(task_data["tasks"]),
+            "next_pending_task": pending_tasks[0] if pending_tasks else None,
+            "next_ready_task": ready_tasks[0] if ready_tasks else None
+        }
     }
 
 

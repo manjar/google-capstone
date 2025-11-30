@@ -18,7 +18,47 @@ from models.schemas import ChatRequest, ChatResponse, TimerUpdateRequest, Memori
 from database.operations import list_timers_from_db
 from tools.timer_tools import update_timer_tool
 from tools.preference_tools import get_user_preferences_tool
+from tools.planner_tools import _task_store  # For enforcement loop
 from utils.logging import log_event
+
+
+# Maximum continuation attempts to prevent infinite loops
+MAX_CONTINUATION_ATTEMPTS = 10
+
+
+def check_pending_tasks(session_id: str) -> tuple[bool, int, list]:
+    """
+    Check if there are pending tasks for a session.
+
+    Returns:
+        Tuple of (has_pending, pending_count, pending_task_labels)
+    """
+    if session_id not in _task_store:
+        return False, 0, []
+
+    task_data = _task_store[session_id]
+    pending_tasks = [
+        t for t in task_data["tasks"]
+        if t["status"] in ("pending", "in_progress", "ready")
+    ]
+    pending_labels = [t["label"] for t in pending_tasks]
+    return len(pending_tasks) > 0, len(pending_tasks), pending_labels
+
+
+def response_asks_question(response_text: str) -> bool:
+    """
+    Check if the response ends with a question (heuristic for proper prompting).
+    """
+    # Strip and check for question mark
+    stripped = response_text.strip()
+    if stripped.endswith("?"):
+        return True
+
+    # Check last sentence for question patterns
+    last_sentences = stripped.split(".")[-1].strip()
+    question_starters = ["what", "when", "where", "how", "which", "would", "do", "does", "is", "are", "can", "could"]
+    lower_last = last_sentences.lower()
+    return any(lower_last.startswith(q) for q in question_starters) or "?" in last_sentences
 
 
 # Jinja2 template environment
@@ -112,10 +152,11 @@ def register_routes(app, runner, memory_watcher_runner):
                 "content_preview": f"Processing: {request.message[:80]}..."
             })
 
-            # Inject current time context into the message
+            # Inject current time and session context into the message
             current_datetime = datetime.now()
-            time_context = f"[Current time: {current_datetime.strftime('%A, %B %d, %Y at %H:%M')}]\n\n"
-            message_with_context = time_context + request.message
+            time_context = f"[Current time: {current_datetime.strftime('%A, %B %d, %Y at %H:%M')}]\n"
+            session_context = f"[Session ID: {session_id}]\n\n"
+            message_with_context = time_context + session_context + request.message
 
             async for event in runner.run_async(
                 user_id=user_id,
@@ -186,6 +227,85 @@ def register_routes(app, runner, memory_watcher_runner):
 
             if not response_text:
                 response_text = "I processed your request."
+
+            # ENFORCEMENT LOOP: Ensure all pending tasks are addressed
+            # This catches cases where the planner stops prompting prematurely
+            continuation_attempts = 0
+
+            while continuation_attempts < MAX_CONTINUATION_ATTEMPTS:
+                has_pending, pending_count, pending_labels = check_pending_tasks(session_id)
+
+                if not has_pending:
+                    # No pending tasks - we're done
+                    log_event("enforcement_loop_complete", {
+                        "session_id": session_id,
+                        "reason": "no_pending_tasks",
+                        "attempts": continuation_attempts
+                    })
+                    break
+
+                if response_asks_question(response_text):
+                    # Response ends with a question - agent is properly prompting
+                    log_event("enforcement_loop_complete", {
+                        "session_id": session_id,
+                        "reason": "response_has_question",
+                        "pending_count": pending_count,
+                        "attempts": continuation_attempts
+                    })
+                    break
+
+                # CRITICAL: Agent stopped prompting with pending tasks!
+                # Force continuation by sending a system message
+                log_event("enforcement_loop_forcing_continuation", {
+                    "session_id": session_id,
+                    "pending_count": pending_count,
+                    "pending_tasks": pending_labels,
+                    "attempt": continuation_attempts + 1
+                })
+
+                continuation_message = (
+                    f"[SYSTEM: There are still {pending_count} pending task(s): {', '.join(pending_labels)}. "
+                    f"You MUST ask the user about the next pending task. Do not stop until all tasks are complete.]"
+                )
+
+                # Add enforcement trace event
+                execution_trace.append({
+                    "type": "EnforcementLoop",
+                    "timestamp": datetime.now().isoformat(),
+                    "event_category": "enforcement",
+                    "content_preview": f"Forcing continuation: {pending_count} pending tasks",
+                    "pending_tasks": pending_labels
+                })
+
+                # Run agent again with continuation prompt
+                continuation_response = ""
+                async for event in runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=types.Content(
+                        role="user",
+                        parts=[types.Part(text=continuation_message)]
+                    )
+                ):
+                    # Capture response text from continuation
+                    if hasattr(event, "content") and event.content:
+                        if hasattr(event.content, "parts") and event.content.parts:
+                            for part in event.content.parts:
+                                if hasattr(part, "text") and part.text:
+                                    continuation_response += part.text
+
+                # Append continuation response (with separator for clarity)
+                if continuation_response:
+                    response_text = response_text.rstrip() + "\n\n" + continuation_response
+
+                continuation_attempts += 1
+
+            if continuation_attempts >= MAX_CONTINUATION_ATTEMPTS:
+                log_event("enforcement_loop_max_attempts", {
+                    "session_id": session_id,
+                    "attempts": continuation_attempts,
+                    "warning": "Max continuation attempts reached"
+                })
 
             # Run memory watcher in parallel to capture notable facts
             # This runs silently and doesn't affect the user response

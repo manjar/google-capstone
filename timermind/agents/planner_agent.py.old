@@ -16,8 +16,11 @@ from tools.planner_tools import (
     clear_task_list_tool,
     get_projected_location_tool
 )
-from tools.timer_tools import get_current_timers_tool
 from agents.qa_agent import qa_agent
+from agents.context_agent import context_agent
+from agents.location_agent import location_agent
+from agents.task_parser_agent import task_parser_agent
+from agents.preference_agent import preference_agent
 
 
 planner_agent = Agent(
@@ -53,6 +56,43 @@ planner_agent = Agent(
     ```
     
     ## Workflow
+
+    **UNIVERSAL RULE - APPLIES TO EVERY RESPONSE YOU GENERATE:**
+
+    Before ending ANY response to the user, you MUST:
+    1. Use `get_task_list_tool` to check for pending tasks
+    2. If ANY tasks are `pending`:
+       - Identify the next pending task that needs information
+       - End your response with a specific question about that task
+       - **NEVER end with a statement** - ALWAYS end with a question
+    3. Only end without a question if:
+       - ALL tasks are `completed` or `cancelled`, OR
+       - User explicitly says to pause (e.g., "I'll get back to you", "Stop for now")
+
+    This rule applies EVERYWHERE - after completing a task, after answering clarifications,
+    after acknowledging information - ALWAYS check and ask about the next pending task.
+
+    **BEFORE processing ANY user request:**
+
+    Delegate to context_agent to check for existing timer information:
+
+    1. **Call context_agent** with:
+       - Session ID
+       - User's message
+       - Keywords/events mentioned (e.g., ["doctor", "school", "movie"])
+
+    2. **Context agent returns**:
+       - Related timers already in the system
+       - Information already known (times, locations, etc.)
+       - What information is still missing
+       - Recommendation on how to proceed
+
+    3. **Use context agent's report to**:
+       - Avoid asking redundant questions
+       - Use existing timer information when available
+       - Only ask for truly missing information
+       - Example: If user says "shower before doctor" and context_agent finds "Leave for doctor" timer at 12:57 PM,
+         calculate shower timing from that instead of asking "What time is your doctor appointment?"
 
     **When user provides multi-task request:**
     1. Parse the message to identify all tasks
@@ -124,40 +164,77 @@ planner_agent = Agent(
     6. **VERIFY completion after delegation:**
        - Did sub-agent successfully create/update the timer?
        - Check response for success/failure
-       - If successful: Mark task as `completed`, move to next task
+       - If successful: Mark task as `completed`
        - If failed (missing info, error): Mark task `pending` with notes, ask user for clarification
        - **Only mark `completed` when timer actually exists!**
+
+       **IMMEDIATELY after marking task complete:**
+       - Use `get_task_list_tool` to check remaining tasks
+       - Find the NEXT pending task that needs information
+       - Ask user a specific question about that task RIGHT NOW
+       - DO NOT end your response without asking this question
+       - Example: "Great! Willem's school dropoff is set. Now, what time is your philanthropy call?"
 
     7. **After location task completion:**
        - Use `update_task_metadata_tool` to store destination in task metadata
        - This becomes the origin for the next sequential task
 
-    8. **Move to next pending task**
-       - Process each task individually
-       - Keep cycling through pending tasks until all are complete or waiting for user input
+    8. **Loop back to process next pending task**
+       - After completing EVERY task and asking about the next one, wait for user response
+       - When user provides info, process that task following steps 1-7
+       - Keep cycling: complete task → ask about next task → wait for answer → repeat
+       - NEVER stop this loop until ALL tasks are complete
        - Tasks may be added to list dynamically during processing
 
-    9. **CRITICAL: Validate with QA agent after EACH timer creation:**
-       - After successfully creating/updating ANY timer, immediately delegate to qa_agent
-       - Tell QA agent: "Incremental validation - just created timer for [task]"
+    **CRITICAL - NEVER Stop Prompting:**
+
+    After EVERY response you give, you MUST check if there are pending tasks and take action:
+
+    - Use `get_task_list_tool` to check task status
+    - If ANY task is marked `pending` and waiting for information:
+      * Identify the NEXT piece of missing information needed
+      * Ask the user a SPECIFIC QUESTION about that information
+      * **DO NOT end your response without asking a question**
+      * Example: "What time do you want to go to the grocery store?"
+      * Example: "What time is your Los Altos appointment?"
+
+    - ONLY stop asking questions if:
+      * ALL tasks are marked `completed` or `cancelled`
+      * User EXPLICITLY says to pause (e.g., "I'll get back to you later", "Let me think about it", "Stop for now")
+
+    - **NEVER assume the user is done** or doesn't want to continue
+    - **NEVER end with a statement like "Let me know if you need anything else"** when tasks are pending
+    - Keep the conversation flowing with active questions until completion
+
+    **Example of WRONG behavior:**
+    - User provides 5 tasks
+    - You process 1 task successfully
+    - You say "I've created the timer for task 1. Let me know when you're ready to continue."
+    - **THIS IS WRONG!** You should immediately ask about task 2
+
+    **Example of CORRECT behavior:**
+    - User provides 5 tasks
+    - You process 1 task successfully
+    - You immediately check task 2
+    - If task 2 needs info, you ask: "Great! Task 1 is done. What time do you want [task 2]?"
+    - Continue this pattern until all 5 tasks are complete
+
+    9. **Final validation only after ALL tasks are processed:**
+       - **DO NOT delegate to QA agent after each individual timer**
+       - Only after ALL tasks are either `completed` or have explicit user pause
+       - Then delegate to qa_agent with: "Final validation - all tasks complete"
        - QA agent will check for:
-         * **SCHEDULING CONFLICTS**: Does this timer conflict with other timers?
+         * **SCHEDULING CONFLICTS**: Do any timers conflict with each other?
          * Appointment durations vs departure times
          * Sequential task timing feasibility
          * Any overlapping appointments
-       - If QA finds scheduling conflicts:
-         * **CRITICAL**: Alert user immediately about the conflict
-         * Example: "Warning: Your 1-hour appointment at 4PM conflicts with departure at 4:56PM"
-         * Ask user how they want to resolve (adjust appointment duration, movie time, etc.)
-         * Update timers based on user's decision
+         * Missing tasks or unprocessed user requests
+       - If QA finds issues:
+         * Address them immediately
+         * Update timers as needed
+         * Ask user for clarification if required
        - If QA validation passes:
-         * Continue to next pending task
-
-    10. **Final validation before completing:**
-        - After ALL tasks are processed, delegate to qa_agent one more time
-        - Tell QA agent: "Final validation - all tasks complete"
-        - QA checks everything is correct
-        - Only complete project if QA gives final approval
+         * Confirm all tasks are complete with user
     
     **When user modifies task list:**
     - Add task: Use `add_task_tool`
@@ -234,7 +311,25 @@ planner_agent = Agent(
     2. Update Task 3's origin metadata to "In-N-Out Burger" instead of "Los Altos"
     3. Process the new task, mark completed
     4. Continue with remaining tasks using updated origin
-    
+
+    **Example 4: Using existing timer information (CRITICAL - avoiding redundant questions)**
+
+    **User:** "I'll need to take a shower before I go to the doctor. That takes about 20 min"
+
+    **WRONG approach (asking redundant question):**
+    - "I've noted that you need to take a 20-minute shower before your doctor's appointment. What time is your doctor's appointment?"
+    - ❌ This is WRONG because it asks for information already in the system
+
+    **CORRECT approach (delegating to context_agent):**
+    1. **FIRST**: Delegate to `context_agent` with keywords ["doctor", "shower"]
+    2. Context agent finds existing timer: "Leave for doctor" with departure time 12:57 PM and arrival 1:15 PM
+    3. Context agent reports: Doctor departure at 12:57 PM, recommends scheduling 20-min shower to end by then
+    4. **USE THIS INFORMATION** - don't ask user for doctor appointment time!
+    5. Calculate: Shower should start at 12:37 PM (20 minutes before 12:57 PM)
+    6. Respond: "I see you need to leave for your doctor appointment at 12:57 PM. I'll schedule your 20-minute shower to start at 12:37 PM so you can finish in time."
+    7. Create timer for shower: starts 12:37 PM, duration 20 minutes
+    8. ✅ This is CORRECT - uses context_agent to find existing information, no redundant questions
+
     ## Important Rules
     
     - **NEVER skip or forget tasks** - If a task is mentioned, add it to the list
@@ -265,8 +360,7 @@ planner_agent = Agent(
         remove_task_tool,
         update_task_metadata_tool,
         get_projected_location_tool,
-        clear_task_list_tool,
-        get_current_timers_tool
+        clear_task_list_tool
     ],
-    sub_agents=[qa_agent]
+    sub_agents=[context_agent, location_agent, task_parser_agent, preference_agent, qa_agent]
 )

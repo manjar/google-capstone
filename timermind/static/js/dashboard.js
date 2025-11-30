@@ -22,10 +22,6 @@ function switchTab(tabName) {
         document.getElementById('chatTab').classList.add('active');
     } else if (tabName === 'thoughts') {
         document.getElementById('thoughtsTab').classList.add('active');
-    } else if (tabName === 'memories') {
-        document.getElementById('memoriesTab').classList.add('active');
-        // Load memories when tab is opened
-        loadMemories();
     }
 }
 
@@ -191,8 +187,16 @@ function updateTimersList(timers) {
         timerRationales.set(timer.id, timer.rationale || 'No explanation available');
     });
 
-    // Sort by priority score descending
-    timers.sort((a, b) => b.priority_score - a.priority_score);
+    // Sort by deadline (earliest first), then by urgency if no deadline
+    timers.sort((a, b) => {
+        // Timers without deadlines go to the end
+        if (!a.deadline && !b.deadline) return 0;
+        if (!a.deadline) return 1;
+        if (!b.deadline) return -1;
+
+        // Compare deadlines
+        return new Date(a.deadline) - new Date(b.deadline);
+    });
 
     listDiv.innerHTML = timers.map(timer => {
         const urgencyClass = timer.urgency_score > 0.7 ? 'high-urgency' :
@@ -216,11 +220,6 @@ function updateTimersList(timers) {
                     <span class="timer-category">${timer.category}</span>
                 </div>
                 ${countdownHtml}
-                <div class="timer-scores">
-                    <span class="score priority">Priority: ${timer.priority_score.toFixed(2)}</span>
-                    <span class="score">Urgency: ${timer.urgency_score.toFixed(2)}</span>
-                    <span class="score">Importance: ${timer.importance_score.toFixed(2)}</span>
-                </div>
             </div>
         `;
     }).join('');

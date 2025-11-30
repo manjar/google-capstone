@@ -9,6 +9,7 @@ from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.memory import InMemoryMemoryService
+from google.adk.tools import preload_memory
 from agents.task_tracker_agent import task_tracker_agent
 from tools.timer_tools import get_current_timers_tool
 from utils.logging import log_event
@@ -40,7 +41,7 @@ Examples:
 
 Today is {today}.
 """.format(today=datetime.now().strftime("%A, %B %d, %Y")),
-    tools=[get_current_timers_tool],
+    tools=[get_current_timers_tool, preload_memory],
     sub_agents=[task_tracker_agent],
     after_agent_callback=auto_save_to_memory
 )

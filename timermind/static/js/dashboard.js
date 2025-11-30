@@ -10,9 +10,10 @@ window.onload = function() {
 };
 
 function switchTab(tabName) {
-    // Remove active class from all tabs and content
-    document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+    // Remove active class only from chat panel tabs and content
+    const chatPanel = document.querySelector('.chat-container');
+    chatPanel.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+    chatPanel.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
 
     // Add active class to selected tab and content
     const selectedTab = event.target;

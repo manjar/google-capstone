@@ -119,8 +119,14 @@ def update_task_status_tool(
     task["updated_at"] = datetime.now(timezone.utc).isoformat()
     
     if notes:
+        # Convert notes to list format if it's currently a string
         if "notes" not in task:
             task["notes"] = []
+        elif isinstance(task["notes"], str):
+            # Preserve the original string note
+            original_note = task["notes"]
+            task["notes"] = [{"text": original_note}]
+
         task["notes"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "text": notes

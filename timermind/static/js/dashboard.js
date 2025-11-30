@@ -680,6 +680,7 @@ function renderTimelineHTML(blocks) {
     // Build blocks
     let blocksHTML = '';
     let lastDay = null;
+    let lastHeaderPosition = 0;
 
     for (const block of blocks) {
         // Check if we need a day header
@@ -690,8 +691,14 @@ function renderTimelineHTML(blocks) {
         });
 
         if (blockDay !== lastDay) {
-            const topPosition = ((block.start - hours[0]) / (60 * 60 * 1000)) * 60;
-            blocksHTML += `<div class="timeline-day-header" style="top: ${topPosition}px">${blockDay}</div>`;
+            const headerPosition = ((block.start - hours[0]) / (60 * 60 * 1000)) * 60;
+            // Use a spacer div to position the header, then the header can be sticky naturally
+            const spacerHeight = headerPosition - lastHeaderPosition;
+            if (spacerHeight > 0) {
+                blocksHTML += `<div style="height: ${spacerHeight}px"></div>`;
+            }
+            blocksHTML += `<div class="timeline-day-header">${blockDay}</div>`;
+            lastHeaderPosition = headerPosition;
             lastDay = blockDay;
         }
 
@@ -723,6 +730,11 @@ function renderTimelineHTML(blocks) {
             </div>
         `;
     }
+
+    // Add a final spacer to ensure the timeline extends to the end
+    const lastBlock = blocks[blocks.length - 1];
+    const totalTimelineHeight = ((lastBlock.end - hours[0]) / (60 * 60 * 1000)) * 60;
+    blocksHTML += `<div style="height: 1px; margin-top: ${totalTimelineHeight - lastHeaderPosition}px"></div>`;
 
     return `
         <div class="timeline-container">

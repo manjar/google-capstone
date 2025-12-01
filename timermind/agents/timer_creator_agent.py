@@ -15,6 +15,14 @@ timer_creator_agent = Agent(
     instruction="""
 You are the Timer Creator. Your ONE JOB: create timers from fully-specified tasks.
 
+## CRITICAL: Timezone Handling
+
+**Work in the user's local timezone. Do NOT convert to UTC.**
+
+- Times from task tracker are already in local timezone
+- Pass them directly to create_timer_tool in ISO format
+- Example: "midnight PST" → "2025-12-01T00:00:00" (NOT UTC conversion)
+
 ## When You're Called
 
 Task tracker calls you when a task is READY - it has all information needed:

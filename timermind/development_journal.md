@@ -729,6 +729,142 @@ That difference is everything.
 
 ---
 
-**Last Updated:** November 17, 2025
-**Current Status:** Phase 5 (Documentation & Polish)
-**Next Major Feature:** Timeline modeling and conflict detection (Q1 2026)
+## Phase 5: Bug Fixes & UI Polish
+
+### December 1, 2025
+
+**Focus:** Production readiness, bug fixes, and timeline view improvements
+
+### Bug Fix: Task Notes Type Mismatch
+
+**Problem Encountered:**
+```
+Error: 'str' object has no attribute 'append'
+Location: tools/planner_tools.py:124 in update_task_status_tool
+```
+
+**Root Cause:**
+When tasks were created via `create_task_list_tool`, the `notes` field could be initialized as a simple string (e.g., "today", "tomorrow"). However, `update_task_status_tool` assumed `notes` was either missing or already a list, attempting to append to it without type checking.
+
+**The Fix (tools/planner_tools.py:121-133):**
+```python
+if notes:
+    # Convert notes to list format if it's currently a string
+    if "notes" not in task:
+        task["notes"] = []
+    elif isinstance(task["notes"], str):
+        # Preserve the original string note
+        original_note = task["notes"]
+        task["notes"] = [{"text": original_note}]
+
+    task["notes"].append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": notes
+    })
+```
+
+**Lesson Learned:** When dealing with agent-created data structures, always validate types before operations. The AI agent could initialize fields in various formats depending on parsing logic.
+
+### Timeline View: Sticky Day Headers
+
+**User Requirement:**
+> "The day header should do two things: when midnight is in view, it should show up at midnight. When the view has been scrolled late enough that midnight is no longer in view, it should be pegged to the top of the view. It should get pushed out of the way when the next day's header gets to the top of the view."
+
+This describes classic CSS sticky positioning behavior for multi-day timeline views.
+
+**Challenge 1: Initial Implementation Issues**
+
+**First Approach (Failed):**
+Used `position: absolute` with `margin-top` positioning for day headers.
+- Problem: Headers overlapped timeline blocks
+- Problem: No sticky behavior when scrolling
+
+**Second Approach (Partially Successful):**
+Used `position: sticky` with `margin-top` for initial positioning.
+- Success: First header (Sunday) stuck correctly
+- Problem: Subsequent headers (Monday, Tuesday) scrolled away instead of sticking
+
+**Root Cause:**
+Mixing flow layout (margin-top on headers) with absolute positioning (blocks) created positioning conflicts. The `margin-top` approach worked for initial placement but interfered with sticky behavior for subsequent headers.
+
+**Final Solution: Spacer Divs (dashboard.js:693-703)**
+
+**Approach:**
+Instead of using `margin-top` to position headers, use empty spacer divs to push headers down to their correct position (midnight). This keeps headers in the normal document flow, allowing CSS sticky to work properly.
+
+**Implementation:**
+```javascript
+// Build blocks
+let blocksHTML = '';
+let lastDay = null;
+let lastHeaderPosition = 0;
+
+for (const block of blocks) {
+    const blockDay = block.start.toLocaleDateString('en-US', {
+        weekday: 'long',
+        month: 'short',
+        day: 'numeric'
+    });
+
+    if (blockDay !== lastDay) {
+        const headerPosition = ((block.start - hours[0]) / (60 * 60 * 1000)) * 60;
+        // Use a spacer div to position the header
+        const spacerHeight = headerPosition - lastHeaderPosition;
+        if (spacerHeight > 0) {
+            blocksHTML += `<div style="height: ${spacerHeight}px"></div>`;
+        }
+        blocksHTML += `<div class="timeline-day-header">${blockDay}</div>`;
+        lastHeaderPosition = headerPosition;
+        lastDay = blockDay;
+    }
+    // ... block rendering
+}
+
+// Add final spacer to extend timeline to full height
+const lastBlock = blocks[blocks.length - 1];
+const totalTimelineHeight = ((lastBlock.end - hours[0]) / (60 * 60 * 1000)) * 60;
+blocksHTML += `<div style="height: 1px; margin-top: ${totalTimelineHeight - lastHeaderPosition}px"></div>`;
+```
+
+**CSS (dashboard.css:603-613):**
+```css
+.timeline-day-header {
+    position: sticky;
+    top: 0;
+    background: #007bff;
+    color: white;
+    padding: 8px 10px;
+    font-weight: 600;
+    z-index: 10;
+    margin-left: -10px;
+    margin-right: -10px;
+}
+```
+
+**How It Works:**
+1. **Spacers position headers**: Empty divs with calculated heights push each day header to its midnight position
+2. **Headers in flow**: Day headers are in normal document flow (not absolutely positioned)
+3. **Sticky behavior**: Each header sticks to `top: 0` when scrolling past its position
+4. **Sequential stacking**: When the next day's header reaches the top, it pushes the previous header out (standard sticky behavior)
+5. **Full timeline height**: Final spacer ensures content extends to the end, giving all headers room to stick
+
+**Result:**
+- Headers appear at midnight when in view
+- Headers stick to top when scrolling past midnight
+- Next day's header properly pushes previous header out
+- All headers maintain sticky behavior throughout scroll
+
+### Design Pattern: Hybrid Layout Model
+
+This solution demonstrates an important pattern for timeline views that mix:
+- **Flow layout** (spacers and headers): For sticky positioning to work
+- **Absolute positioning** (event blocks): For precise time-based placement
+- **High z-index headers**: To overlay on top of absolutely positioned blocks
+
+The key insight: Sticky positioning requires elements in the flow, but timeline events need absolute positioning for precise temporal placement. Spacer divs bridge these two layout models.
+
+---
+
+**Last Updated:** December 1, 2025
+**Current Status:** Phase 5 (Bug Fixes & UI Polish)
+**Next Major Feature:** Google Calendar integration (Q1 2026)
